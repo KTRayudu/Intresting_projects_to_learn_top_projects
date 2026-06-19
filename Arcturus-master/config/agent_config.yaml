@@ -1,0 +1,130 @@
+agents:
+  ManagerAgent:
+    model: gemini
+    mcp_servers: []
+    skills:
+      - manager
+    description: Receives a user request and decomposes it into a DAG of sub-tasks for Worker Agents
+  PlannerAgent:
+    model: gemini
+    mcp_servers: []
+    skills:
+    - planner
+    - web_clipper
+    - research_scientist
+    - agent-manager-skill
+    - startup-business-analyst-market-opportunity
+    description: Generates the execution plan graph.
+  BrowserAgent:
+    model: gemini
+    mcp_servers:
+    - browser
+    skills:
+    - browser
+    - browser-extension-builder
+    description: Browses the web using text search or vision.
+  CoderAgent:
+    model: gemini
+    mcp_servers:
+    - sandbox
+    - browser
+    - rag
+    skills:
+    - coder
+    - python_coding
+    - debugging
+    - git_commit
+    - firecrawl-scraper
+    description: 'Thinks, writes, and automatically executes required code in a single
+      atomic step.
+
+      '
+  RetrieverAgent:
+    model: gemini
+    mcp_servers:
+    - rag
+    - browser
+    skills:
+    - retriever
+    description: Gathers raw external or document-based info.
+  SummarizerAgent:
+    model: gemini
+    mcp_servers:
+    - browser
+    - rag
+    skills:
+    - summarizer
+    description: Synthesizes final answers.
+  DistillerAgent:
+    model: gemini
+    mcp_servers: []
+    skills:
+    - distiller
+    description: Synthesizes summaries or bullets.
+  ThinkerAgent:
+    model: gemini
+    mcp_servers: []
+    skills:
+    - thinker
+    description: Clusters, compares, or resolves logic.
+  FormatterAgent:
+    model: gemini
+    mcp_servers: []
+    skills:
+    - formatter
+    - web_clipper
+    description: 'Beautifies final outputs into human-readable formats (Markdown,
+      HTML, tables).
+
+      '
+  ClarificationAgent:
+    model: gemini
+    mcp_servers: []
+    skills:
+    - clarification
+    description: Queries human or confirms ambiguous steps.
+  QAAgent:
+    model: gemini
+    mcp_servers: []
+    skills:
+    - qa
+    description: 'Reviews and critiques final or interim products.
+
+      '
+  TestAgent:
+    model: ollama
+    mcp_servers: []
+    skills:
+    - test_agent
+    description: Generates Pytest tests for Python code.
+  DebuggerAgent:
+    model: ollama
+    mcp_servers: []
+    skills:
+    - debugger_agent
+    description: Fixes code based on test failures.
+  SchedulerAgent:
+    model: gemini
+    mcp_servers: []
+    skills:
+    - scheduler
+    description: Defines time-aware or trigger-bound execution.
+  IDEAgent:
+    model: gemini
+    mcp_servers:
+    - rag
+    - sandbox
+    - browser
+    - git
+    skills:
+    - coder
+    - python_coding
+    - debugging
+    - visual_explainer
+    description: Specialized workspace assistant for deep code analysis and interactive debugging.
+  SafetyAgent:
+    model: gemini
+    mcp_servers: []
+    skills: []
+    description: |
+      Reviews outputs for safety, policy, and content guidelines.

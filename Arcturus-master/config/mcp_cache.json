@@ -1,0 +1,266 @@
+{
+  "sandbox": [
+    {
+      "name": "run_python_script",
+      "description": "\n    Execute Python code in a secure sandbox.\n    Use this for math, data processing, and logic.\n    Returns the stdout and result of the execution.\n    ",
+      "inputSchema": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "run_python_scriptArguments",
+        "type": "object"
+      }
+    }
+  ],
+  "browser": [
+    {
+      "name": "web_search",
+      "description": "Search the web using multiple engines (DuckDuckGo, Bing, Ecosia, etc.) and return a list of relevant result URLs",
+      "inputSchema": {
+        "properties": {
+          "string": {
+            "title": "String",
+            "type": "string"
+          },
+          "integer": {
+            "default": 5,
+            "title": "Integer",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "string"
+        ],
+        "title": "web_searchArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "web_extract_text",
+      "description": "Extract readable text from a webpage using robust methods (Playwright/Trafilatura).",
+      "inputSchema": {
+        "properties": {
+          "string": {
+            "title": "String",
+            "type": "string"
+          }
+        },
+        "required": [
+          "string"
+        ],
+        "title": "web_extract_textArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "search_web_with_text_content",
+      "description": "Search web and return URLs with extracted text content. Gets both URLs and readable text from top search results. Ideal for exhaustive research.",
+      "inputSchema": {
+        "properties": {
+          "string": {
+            "title": "String",
+            "type": "string"
+          }
+        },
+        "required": [
+          "string"
+        ],
+        "title": "search_web_with_text_contentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "fetch_search_urls",
+      "description": "Get top website URLs for your search query. Just gets the URLs not the contents.",
+      "inputSchema": {
+        "properties": {
+          "string": {
+            "title": "String",
+            "type": "string"
+          },
+          "integer": {
+            "default": 5,
+            "title": "Integer",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "string"
+        ],
+        "title": "fetch_search_urlsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "webpage_url_to_raw_text",
+      "description": "Extract readable text from a webpage.",
+      "inputSchema": {
+        "properties": {
+          "string": {
+            "title": "String",
+            "type": "string"
+          }
+        },
+        "required": [
+          "string"
+        ],
+        "title": "webpage_url_to_raw_textArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "browser_use_action",
+      "description": "\n    Execute a complex browser task using Vision and generic reasoning.\n    Use this for: Logging in, filling forms, navigating complex sites, or when text search fails.\n    WARNING: Slow and expensive.\n    ",
+      "inputSchema": {
+        "properties": {
+          "string": {
+            "title": "String",
+            "type": "string"
+          },
+          "headless": {
+            "default": true,
+            "title": "Headless",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "string"
+        ],
+        "title": "browser_use_actionArguments",
+        "type": "object"
+      }
+    }
+  ],
+  "rag": [
+    {
+      "name": "preview_document",
+      "description": "Preview a document using the AI-enhanced extraction logic used for indexing.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "preview_documentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "ask_document",
+      "description": "Ask a question about a specific document.\n    Incorporates chat history, relevant document extracts, and optional image input.\n    ",
+      "inputSchema": {
+        "properties": {
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "doc_id": {
+            "title": "Doc Id",
+            "type": "string"
+          },
+          "history": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "image": {
+            "default": null,
+            "title": "Image",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "doc_id"
+        ],
+        "title": "ask_documentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "search_stored_documents_rag",
+      "description": "Search old stored documents like PDF, DOCX, TXT, etc. to get relevant extracts. \n    Optionally provide doc_path to search within a specific document only.\n    ",
+      "inputSchema": {
+        "properties": {
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "doc_path": {
+            "default": null,
+            "title": "Doc Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "search_stored_documents_ragArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "keyword_search",
+      "description": "Search for exact keyword matches across all indexed document chunks.\n    Returns a list of document paths that contain the matching text.\n    ",
+      "inputSchema": {
+        "properties": {
+          "query": {
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "keyword_searchArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "caption_images",
+      "description": "",
+      "inputSchema": {
+        "properties": {
+          "img_url_or_path": {
+            "title": "Img Url Or Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "img_url_or_path"
+        ],
+        "title": "caption_imagesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "reindex_documents",
+      "description": "Trigger a manual re-index of the RAG documents. \n    Optionally provide a target_path (relative to data/ folder) to index a specific file.\n    ",
+      "inputSchema": {
+        "properties": {
+          "target_path": {
+            "default": null,
+            "title": "Target Path",
+            "type": "string"
+          }
+        },
+        "title": "reindex_documentsArguments",
+        "type": "object"
+      }
+    }
+  ]
+}

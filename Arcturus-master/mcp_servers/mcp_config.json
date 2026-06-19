@@ -1,0 +1,29 @@
+{
+  "browser": {
+    "command": "uv",
+    "args": [
+      "run",
+      "server_browser.py"
+    ],
+    "type": "local-script",
+    "enabled": true
+  },
+  "rag": {
+    "command": "uv",
+    "args": [
+      "run",
+      "server_rag.py"
+    ],
+    "type": "local-script",
+    "enabled": true
+  },
+  "sandbox": {
+    "command": "uv",
+    "args": [
+      "run",
+      "server_sandbox.py"
+    ],
+    "type": "local-script",
+    "enabled": true
+  }
+}

@@ -1,0 +1,1791 @@
+# Runs Router - Handles agent run execution, listing, and management
+import asyncio
+import json
+import time
+from pathlib import Path
+from datetime import datetime
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Body
+from pydantic import BaseModel
+from typing import Optional
+from ops.tracing import run_span, run_throttled_span, agent_execute_node_span, force_flush
+from opentelemetry.trace import Status, StatusCode
+from shared.state import (
+    active_loops,
+    get_multi_mcp,
+    get_remme_store,
+    get_remme_extractor,
+    get_unified_extractor,
+    signal_run_complete,
+    push_stream_chunk,
+    finish_stream,
+    has_stream_queue,
+    get_stream_chunk_count,
+    PROJECT_ROOT,
+)
+from core.auth.context import get_current_user_id, set_current_user_id
+from core.loop import AgentLoop4
+from core.graph_adapter import nx_to_reactflow
+from remme.utils import get_embedding
+from config.settings_loader import settings
+from core.skills.manager import skill_manager
+
+from core.skills.manager import skill_manager
+
+
+router = APIRouter(tags=["Runs"])
+
+
+def cleanup_stale_sessions():
+    """Mark all 'running' sessions as 'failed' on server startup.
+
+    Called once during lifespan — no active loops exist yet, so any session
+    still marked 'running' on disk is leftover from a previous crash.
+    Cleans both graph-level AND node-level statuses so list_runs() sees them
+    as failed (list_runs computes status from node statuses, not just graph).
+    """
+    summaries_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+    if not summaries_dir.exists():
+        return
+    cleaned = 0
+    for session_file in summaries_dir.rglob("session_*.json"):
+        try:
+            data = json.loads(session_file.read_text())
+            dirty = False
+
+            # Fix graph-level status
+            graph = data.get("graph", {})
+            if graph.get("status") == "running":
+                graph["status"] = "failed"
+                data["graph"] = graph
+                dirty = True
+
+            # Fix node-level statuses (list_runs computes status from these)
+            for node in data.get("nodes", []):
+                if node.get("status") == "running":
+                    node["status"] = "failed"
+                    dirty = True
+
+            if dirty:
+                session_file.write_text(json.dumps(data))
+                cleaned += 1
+        except Exception:
+            pass
+    if cleaned:
+        print(f"🧹 Cleaned {cleaned} stale 'running' sessions → 'failed'")
+
+
+# Get shared instances
+multi_mcp = get_multi_mcp()
+remme_store = get_remme_store()
+remme_extractor = get_remme_extractor()
+
+
+# === Pydantic Models ===
+
+
+class RunRequest(BaseModel):
+    query: str
+    model: str = None  # Will use settings default if not provided
+    source: str = "web"  # "web" or "voice"
+    stream: bool = False  # Whether the caller expects a streaming response
+    space_id: Optional[str] = None  # Phase 3C: optional space to scope session and retrieval
+    dry_run: Optional[bool] = (
+        None  # If True, skip agent; return synthetic run (for automation). None = use DRY_RUN_RUNS env.
+    )
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        if self.model is None:
+            self.model = settings.get("agent", {}).get("default_model", "gemini-2.5-flash")
+
+
+class RunResponse(BaseModel):
+    id: str
+    status: str
+    created_at: str
+    query: str
+
+
+class UserInputRequest(BaseModel):
+    node_id: str
+    response: str
+
+
+class AgentTestRequest(BaseModel):
+    """Optional request body for agent testing"""
+
+    pass
+
+
+class ExecuteNodeRequest(BaseModel):
+    mode: str = "remaining"  # "remaining", "all_from_here", "single", "all"
+    input: Optional[str] = None
+
+
+# === Background Tasks ===
+
+
+async def process_resume(run_id: str, session_path: Path):
+    """Background task to resume agent loop from a file.
+    WATCHTOWER: Wraps with run_span so resume runs appear in Jaeger with run_id.
+    """
+    from ops.tracing import run_span
+
+    with run_span(run_id, "resume"):
+        try:
+            loop = AgentLoop4(multi_mcp=multi_mcp)
+            # Register the LOOP instance immediately so we can stop it
+            active_loops[run_id] = loop
+
+            print(f"[{run_id}] Resuming run from {session_path}")
+            await loop.resume(str(session_path))
+        except Exception as e:
+            print(f"Run {run_id} resume failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+        finally:
+            # Clean up
+            if run_id in active_loops:
+                del active_loops[run_id]
+
+
+def _extract_voice_output(context) -> str:
+    """
+    Quickly extract TTS-friendly output from the agent context.
+    Called immediately after loop.run() — must be fast.
+    """
+    if not context or not context.plan_graph:
+        return "I've completed your request."
+
+    # 1. Look for FormatterAgent output (the final polished report)
+    for node_id in context.plan_graph.nodes:
+        node = context.plan_graph.nodes[node_id]
+        agent_type = node.get("agent", "")
+        output = node.get("output", {})
+
+        if not output or not isinstance(output, dict):
+            continue
+
+        if "Format" in agent_type or agent_type == "FormatterAgent":
+            md = output.get("markdown_report") or output.get("formatted_report")
+            if not md:
+                for k, v in output.items():
+                    if ("report" in k.lower() or "formatted" in k.lower()) and isinstance(v, str):
+                        md = v
+                        break
+            if md and len(md) > 50:
+                return md
+
+    # 2. Fallback: find the last completed node with substantial output
+    for node_id in reversed(list(context.plan_graph.nodes)):
+        if node_id == "ROOT":
+            continue
+        node = context.plan_graph.nodes[node_id]
+        if node.get("status") != "completed":
+            continue
+        output = node.get("output", {})
+
+        if isinstance(output, dict):
+            best = ""
+            for v in output.values():
+                if isinstance(v, str) and len(v) > len(best):
+                    best = v
+            if len(best) > 50:
+                return best
+        elif isinstance(output, str) and len(output) > 50:
+            return output
+
+    return "I've completed your request."
+
+
+async def process_run(
+    run_id: str,
+    query: str,
+    source: str = "web",
+    stream: bool = False,
+    skill_id: str = None,
+    space_id: Optional[str] = None,
+    user_id: str = None,
+    display_query: Optional[str] = None,
+):
+    """
+    Background task: retrieve Remme memories, run agent loop, extract new memories.
+    WATCHTOWER: Root span for the entire agent run.
+    """
+    if user_id:
+        set_current_user_id(user_id)
+
+    # Throttle: safety net — block if budget exceeded (e.g. race with concurrent requests)
+    try:
+        from ops.admin.spans_repository import get_spans_collection
+        from ops.admin.throttle import ThrottlePolicy
+
+        coll = get_spans_collection()
+        policy = ThrottlePolicy(spans_collection=coll)
+        allowed, reason = policy.check_budget()
+        if not allowed:
+            with run_throttled_span(run_id, reason, query):
+                pass
+            force_flush()
+            return  # Run aborted; no session created (client may get 404 when polling)
+    except Exception:
+        pass
+
+    with run_span(run_id, query or "") as span:
+        skill = None
+        context = None
+        memory_context = ""
+        results = []
+        try:
+            # 0. SKILL MATCHING & START HOOK
+            context = None  # Initialize early for safe access in finally block
+            skill = None
+            if not skill_id:
+                skill_id = skill_manager.match_intent(query)
+
+            if skill_id:
+                skill = skill_manager.get_skill(skill_id)
+                if skill:
+                    print(f"[{run_id}] 🧠 Skill Detected: {skill_id}")
+                    skill_context = getattr(skill, "context", None)
+                    if skill_context is None:
+                        from types import SimpleNamespace
+
+                        skill_context = SimpleNamespace(run_id=None, agent_id=None, config={})
+                        setattr(skill, "context", skill_context)
+                    skill_context.run_id = run_id
+                    skill_context.agent_id = source
+                    skill_context.config = {"source": source, "query": query}
+
+                    # Call On Start Hook (allows prompt modification)
+                    query = await skill.on_run_start(query)
+                    print(f"[{run_id}] 🧠 Skill '{skill_id}' modified prompt.")
+
+            # 1. RETRIEVE MEMORIES (Remme)
+            # Orchestration: memory_retriever handles semantic recall, entity recall, graph expansion, merge
+            try:
+                from memory.memory_retriever import retrieve
+
+                # Phase 3C: use space_id from request, or from existing session
+                _space_id = space_id
+                if _space_id is None:
+                    try:
+                        from memory.knowledge_graph import get_knowledge_graph
+
+                        kg = get_knowledge_graph()
+                        if kg and kg.enabled:
+                            _space_id = kg.get_space_for_session(run_id)
+                    except Exception:
+                        pass
+                # Link session to space at run start so the run appears under the space even if no memories are extracted
+                if _space_id is not None:
+                    try:
+                        from memory.knowledge_graph import get_knowledge_graph
+
+                        _kg = get_knowledge_graph()
+                        if _kg and _kg.enabled:
+                            _kg.get_or_create_session(run_id, space_id=_space_id)
+                    except Exception:
+                        pass
+                memory_context, results = retrieve(
+                    query,
+                    space_id=_space_id,
+                )
+                if memory_context:
+                    print(f" Remme: Injected memory context into run {run_id}")
+            except Exception as e:
+                print(f"⚠️ Remme Retrieval Failed: {e}")
+            loop = AgentLoop4(multi_mcp=multi_mcp)
+            # Register the LOOP instance immediately so we can stop it
+            active_loops[run_id] = loop
+
+            # Execute the agent loop (planning -> DAG execution)
+            # The loop maintains its own internal context and session
+            print(f"[{run_id}] MEMORY CONTEXT INJECTED:\n{memory_context}")
+            try:
+                run_globals = {"user_id": user_id} if user_id else {}
+                context = await loop.run(
+                    query, [], run_globals, [], session_id=run_id, memory_context=memory_context, space_id=_space_id,
+                    display_query=display_query, source=source,
+                )
+            except asyncio.CancelledError:
+                span.set_status(Status(StatusCode.ERROR, "cancelled"))
+                print(f"[{run_id}] Run cancelled.")
+                context = loop.context  # Recovery context from loop if possible
+
+            # Mark span as error if run completed with failure status (max iterations, cost exceeded, etc.)
+            if context and getattr(context, "plan_graph", None):
+                status = context.plan_graph.graph.get("status")
+                if status in ("failed", "cost_exceeded"):
+                    span.set_status(Status(StatusCode.ERROR, context.plan_graph.graph.get("error", status)))
+
+            # 2. EXTRACT NEW MEMORIES (Remme)
+            # We put this in a finally block? No, because we want it only on success/completion of meaningful work.
+            # But if user stops it, we might want to extract partials.
+            # For now, let's leave it after run() but handle the stop case explicitly if context is returned.
+
+        except Exception as e:
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            span.record_exception(e)
+            print(f"Run {run_id} failed: {e}")
+            if skill:
+                try:
+                    await skill.on_run_failure(str(e))
+                except Exception as fe:
+                    print(f"⚠️ [Skill] Failure hook failed: {fe}")
+            if skill:
+                try:
+                    await skill.on_run_failure(str(e))
+                except Exception as fe:
+                    print(f"⚠️ [Skill] Failure hook failed: {fe}")
+        finally:
+            # Clean up
+            if run_id in active_loops:
+                del active_loops[run_id]
+
+            # Attempt extraction if we have context (even if stopped)
+            # Note: 'context' variable needs to be accessible here.
+            # After run completes, extract new facts from the session
+            try:
+                # Get the history from context (Plan Graph or Session Summary)
+                # For now, we don't return the full conversation history from loop.run directly
+                # But context has plan_graph...
+                # Ideally we extract from the "Summary" generated by the ReportingAgent if available
+                # OR we can pass the query and the FINAL output.
+
+                # Simple V1: Extract from Query + Final Answer (if available)
+                final_output = ""
+                # Collect outputs from completed nodes in the plan graph
+                if context and context.plan_graph:
+                    # Find nodes with output
+                    for node_id in context.plan_graph.nodes:
+                        node = context.plan_graph.nodes[node_id]
+                        if node.get("status") == "completed" and node.get("output"):
+                            final_output += f"{node_id} Output: {str(node['output'])}\n"
+
+                history = [{"role": "assistant", "content": final_output}]
+
+                print(f" Remme: Extracting facts from run {run_id}...")
+                from memory.mnemo_config import is_mnemo_enabled
+
+                def _resolve_memory_id(alias_or_id: str, existing: list) -> Optional[str]:
+                    """Resolve T001-style alias (or slug_T002) to real Qdrant point ID; pass-through UUIDs/integers."""
+                    if not alias_or_id or not existing:
+                        return alias_or_id
+                    import re
+
+                    s = str(alias_or_id).strip()
+                    m = re.match(r"^T(\d+)$", s, re.IGNORECASE)
+                    if not m:
+                        m = re.search(r"T(\d+)$", s, re.IGNORECASE)
+                    if m:
+                        idx = int(m.group(1)) - 1
+                        if 0 <= idx < len(existing) and existing[idx].get("id"):
+                            return existing[idx]["id"]
+                    return alias_or_id
+
+                extraction = None
+                if is_mnemo_enabled():
+                    unified = get_unified_extractor()
+                    extraction = await asyncio.to_thread(
+                        unified.extract_from_session, query, history, existing_memories=results
+                    )
+                    print(f" Remme: Extracted MEM from run {run_id}---->{extraction}")
+                    commands = [{"action": m.action, "text": m.text, "id": m.id} for m in extraction.memories]
+                    preferences = None  # do not write to hubs; step 3 ingests facts to Neo4j
+                else:
+                    commands, preferences = await asyncio.to_thread(
+                        remme_extractor.extract,
+                        query,
+                        history,
+                        existing_memories=results,
+                    )
+
+                session_memory_ids = []
+                if commands:
+                    for cmd in commands:
+                        if not isinstance(cmd, dict):
+                            print(f"⚠️ Remme: Skipping invalid command format: {cmd}")
+                            continue
+
+                        action = cmd.get("action")
+                        text = cmd.get("text")
+                        target_id_raw = cmd.get("id")
+                        target_id = _resolve_memory_id(target_id_raw, results) if target_id_raw else None
+
+                        try:
+                            if action == "add" and text:
+                                emb = get_embedding(text, task_type="search_document")
+                                meta = {"session_id": run_id}
+                                if space_id:
+                                    meta["space_id"] = space_id
+                                added = remme_store.add(
+                                    text,
+                                    emb,
+                                    category="derived",
+                                    source=f"run_{run_id}",
+                                    metadata=meta,
+                                    space_id=space_id,
+                                    skip_kg_ingest=is_mnemo_enabled(),
+                                )
+                                if added and isinstance(added, dict) and added.get("id"):
+                                    session_memory_ids.append(added["id"])
+                                print(f"✅ Remme: Added new fact: {text}")
+                            elif action == "update" and target_id and text:
+                                emb = get_embedding(text, task_type="search_document")
+                                remme_store.update(target_id, text=text, embedding=emb)
+                                print(f"🔄 Remme: Updated fact {target_id_raw or target_id}: {text}")
+                            elif action == "delete" and target_id:
+                                remme_store.delete(target_id)
+                                print(f"🗑️ Remme: Deleted fact {target_id_raw or target_id}")
+                        except Exception as e:
+                            print(f"❌ Remme Action Failed: {e}")
+
+                if is_mnemo_enabled() and extraction and session_memory_ids:
+                    try:
+                        from memory.knowledge_graph import get_knowledge_graph
+                        from memory.user_id import get_user_id
+
+                        kg = get_knowledge_graph()
+                        if kg and kg.enabled:
+                            user_id = get_user_id()
+                            kg_result = kg.ingest_from_unified_extraction(
+                                user_id,
+                                run_id,
+                                session_memory_ids,
+                                extraction,
+                                category="derived",
+                                source="session",
+                                space_id=space_id,
+                            )
+                            entity_ids = kg_result.get("entity_ids", [])
+                            entity_labels = kg_result.get("entity_labels", [])
+                            if entity_ids or entity_labels:
+                                meta = {"entity_ids": entity_ids}
+                                if entity_labels:
+                                    meta["entity_labels"] = entity_labels
+                                for mid in session_memory_ids:
+                                    remme_store.update(mid, metadata=meta)
+                            print(
+                                f"✅ Remme: Ingested session extraction to Neo4j ({len(session_memory_ids)} memories, facts + evidence)"
+                            )
+                    except Exception as e:
+                        print(f"⚠️ Remme Neo4j session ingestion failed: {e}")
+
+                if not is_mnemo_enabled() and preferences:
+                    from remme.extractor import apply_preferences_to_hubs
+
+                    apply_preferences_to_hubs(preferences)
+                    print(f"✅ Remme: Processed {len(preferences)} preference updates.")
+
+                if commands:
+                    print(f"✅ Remme: Processed {len(commands)} memory updates.")
+                else:
+                    print(f"ℹ️ Remme: No new facts extracted from run {run_id}.")
+
+            except Exception as e:
+                print(f"⚠️ Remme Extraction Failed: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+            # 3. AUTO-SAVE REPORTS TO NOTES
+            try:
+                if context and context.plan_graph:
+                    import re
+
+                    notes_dir = PROJECT_ROOT / "data" / "Notes" / "Arcturus"
+                    notes_dir.mkdir(parents=True, exist_ok=True)
+
+                    def sanitize_filename(title):
+                        title = re.sub(r'[\\/*?:"<>|#]', "", title)
+                        title = title.replace("\n", " ").strip()
+                        return title[:60].strip()
+
+                    def extract_title(content):
+                        match = re.search(r"^#+\s+(.+)$", content, re.MULTILINE)
+                        if match:
+                            return match.group(1).strip()
+                        # Fallback to first non-empty line
+                        lines = [l.strip() for l in content.split("\n") if l.strip()]
+                        if lines:
+                            return lines[0]
+                        return "Untitled Report"
+
+                    for node_id in context.plan_graph.nodes:
+                        node = context.plan_graph.nodes[node_id]
+                        agent_type = node.get("agent", "")
+                        output = node.get("output", {})
+                        if not output:
+                            continue
+
+                        # Check for Formatter output keys
+                        markdown = output.get("markdown_report")
+                        if not markdown:
+                            for k, v in output.items():
+                                if k.startswith("formatted_report") and isinstance(v, str):
+                                    markdown = v
+                                    break
+
+                        if markdown and len(markdown) > 100:
+                            title = extract_title(markdown)
+                            filename = sanitize_filename(title) + ".md"
+                            target_path = notes_dir / filename
+
+                            if target_path.exists() and len(target_path.read_text(encoding="utf-8")) >= len(markdown):
+                                continue
+
+                            with open(target_path, "w", encoding="utf-8") as f:
+                                f.write(markdown)
+                            print(f"✅ Auto-Saved Report to Notes: {filename}")
+
+            except Exception as e:
+                print(f"⚠️ Failed to auto-save report: {e}")
+
+            # Return result for Scheduler/Skills
+            final_result = {"status": "completed", "run_id": run_id}
+            if context and context.plan_graph:
+                # Check for any failed nodes
+                for node_id in context.plan_graph.nodes:
+                    node = context.plan_graph.nodes[node_id]
+                    if node.get("status") == "failed":
+                        final_result["status"] = "failed"
+                        final_result["error"] = node.get("error")
+                        break
+
+            if context:
+                try:
+                    output_str = ""
+                    if context.plan_graph:
+                        # 1. Look for FormatterAgent output first (The Final Report)
+                        for node_id in context.plan_graph.nodes:
+                            node = context.plan_graph.nodes[node_id]
+                            node_agent = node.get("agent", "")
+                            out = node.get("output", {})
+
+                            if node_agent == "FormatterAgent" or "Format" in node_agent:
+                                if isinstance(out, dict):
+                                    md = out.get("markdown_report")
+                                    if not md:
+                                        for k, v in out.items():
+                                            if (k.startswith("formatted_report") or k == "report") and isinstance(
+                                                v, str
+                                            ):
+                                                md = v
+                                                break
+
+                                    if md:
+                                        output_str = md
+                                        break
+
+                                    if isinstance(out.get("output"), str) and len(out["output"]) > 100:
+                                        output_str = out["output"]
+                                        break
+
+                        # 2. Fallback: Find any node with a substantial string output
+                        if not output_str:
+                            for node_id in reversed(list(context.plan_graph.nodes)):
+                                if node_id == "ROOT":
+                                    continue
+                                node = context.plan_graph.nodes[node_id]
+                                out = node.get("output", {})
+
+                                if isinstance(out, dict):
+
+                                    def find_largest_string(d):
+                                        largest = ""
+                                        for v in d.values():
+                                            if isinstance(v, str):
+                                                if len(v) > len(largest):
+                                                    largest = v
+                                            elif isinstance(v, dict):
+                                                sub = find_largest_string(v)
+                                                if len(sub) > len(largest):
+                                                    largest = sub
+                                        return largest
+
+                                    largest_str = find_largest_string(out)
+                                    if len(largest_str) > 50:
+                                        output_str = largest_str
+                                        break
+
+                                elif isinstance(out, str) and len(out) > 50:
+                                    output_str = out
+                                    break
+
+                        # 3. RUTHLESS CLEANING: Remove typical JSON leakage if content is actually Markdown
+                        if output_str:
+                            import re
+
+                            if (output_str.startswith("{") and output_str.endswith("}")) or (
+                                output_str.startswith("[") and output_str.endswith("]")
+                            ):
+                                try:
+                                    data = json.loads(output_str)
+                                    if isinstance(data, dict):
+                                        for k in ["markdown_report", "formatted_report", "output", "summary", "report"]:
+                                            if data.get(k) and isinstance(data[k], str) and len(data[k]) > 50:
+                                                output_str = data[k]
+                                                break
+                                except Exception:
+                                    pass
+
+                            output_str = re.sub(r"^```(?:markdown)?\n", "", output_str)
+                            output_str = re.sub(r"\n```$", "", output_str)
+
+                        final_result["output"] = output_str.strip() if output_str else "No substantial output found."
+                        if final_result.get("status") == "failed":
+                            final_result["summary"] = f"Failed: {final_result.get('error', 'Unknown error')}"
+                        else:
+                            final_result["summary"] = output_str.strip() if output_str else "Completed."
+                except Exception as e:
+                    print(f"⚠️ Extraction Error: {e}")
+                    # Ensure output is always set, even if extraction failed
+                    if "output" not in final_result:
+                        final_result["output"] = "I've processed your request."
+
+            # ── Voice pipeline: signal completion ──────────────────────────────
+            # NOTE: Text chunks are pushed incrementally per-node by _execute_dag
+            # (via push_stream_chunk). Here we only need to:
+            #   1. Close the stream queue with finish_stream (TTS consumer: no more chunks)
+            #   2. Signal the completion Event (for the Event-based / non-streamed path)
+            voice_output = final_result.get("output", "I've completed your request.")
+
+            # --- PREVENT SPEAKING ERRORS ---
+            if final_result.get("status") == "failed":
+                # Use a polite generic message instead of technical error strings
+                # (Technical errors are still visible in the UI 'error' field)
+                voice_output = "I'm sorry, I encountered an error while processing your request."
+
+            # If skill provided a summary, use it for voice
+            if skill and final_result.get("status") == "completed":
+                try:
+                    print(f"[{run_id}] 🧠 Executing Success Hook for skill: {skill_id}")
+                    skill_result = await skill.on_run_success(final_result)
+                    if skill_result and isinstance(skill_result, dict):
+                        if "summary" in skill_result:
+                            final_result["skill_summary"] = skill_result["summary"]
+                            if source == "voice":
+                                voice_output = skill_result["summary"]
+                        if "file_path" in skill_result:
+                            final_result["skill_file_path"] = skill_result["file_path"]
+                except Exception as se:
+                    print(f"⚠️ [Skill] Success hook failed for {skill_id}: {se}")
+
+            output_len = len(voice_output) if voice_output else 0
+            try:
+                if has_stream_queue(run_id):
+                    # Chunks were already pushed incrementally — just close the stream.
+                    if get_stream_chunk_count(run_id) == 0:
+                        if not voice_output or not voice_output.strip():
+                            voice_output = "I've completed your request."
+                        push_stream_chunk(run_id, voice_output)
+                        print(f"📡 [Voice] Fallback: pushed full output for run {run_id} ({output_len} chars)")
+                    else:
+                        print(f"📡 [Voice] Closing stream for run {run_id} (chunks were pushed incrementally)")
+
+                    finish_stream(run_id)
+                elif source == "voice" and stream:
+                    # Only warn if it's a voice run and we EXPECTED streaming but the queue is missing
+                    print(
+                        f"⚠️ [Voice] No stream queue registered for run {run_id}! "
+                        f"Response not queued for TTS: "
+                        f"{voice_output[:100] if output_len > 100 else voice_output}"
+                    )
+
+                # 4. SKILL SUCCESS HOOK
+                if skill:
+                    try:
+                        print(f"[{run_id}] 🧠 Executing Success Hook for skill: {skill_id}")
+                        skill_result = await skill.on_run_success(final_result)
+                        if skill_result and isinstance(skill_result, dict):
+                            if "summary" in skill_result:
+                                final_result["skill_summary"] = skill_result["summary"]
+                                # Update voice output if skill provided a specific summary
+                                # (e.g. for "check my email", the skill summary is better than the agent's raw output)
+                                if source == "voice":
+                                    voice_output = skill_result["summary"]
+                            if "file_path" in skill_result:
+                                final_result["skill_file_path"] = skill_result["file_path"]
+                    except Exception as se:
+                        print(f"⚠️ [Skill] Success hook failed for {skill_id}: {se}")
+
+                # Signal run complete (for the Event-based / non-streaming path)
+                signal_run_complete(run_id, voice_output)
+            except Exception as e:
+                print(f"❌ [Voice] Failed to signal voice pipeline: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+            return final_result
+
+
+# === Helpers ===
+
+
+def _extract_output_str(data: dict) -> str:
+    """Extract the best human-readable output string from a saved session graph.
+
+    Priority:
+    1. FormatterAgent node output (markdown_report / formatted_report)
+    2. Any node with a substantial string output (largest wins)
+    3. Falls back to empty string if nothing found.
+
+    Args:
+        data: Parsed session JSON (node-link format from NetworkX).
+
+    Returns:
+        Cleaned output string, or empty string if nothing substantial found.
+    """
+    output_str = ""
+    nodes = data.get("nodes", [])
+
+    # 1. FormatterAgent output first (The Final Report)
+    for node in nodes:
+        node_agent = node.get("agent", "")
+        out = node.get("output", {})
+        if node_agent == "FormatterAgent" or "Format" in node_agent:
+            if isinstance(out, dict):
+                md = out.get("markdown_report")
+                if not md:
+                    for k, v in out.items():
+                        if (k.startswith("formatted_report") or k == "report") and isinstance(v, str):
+                            md = v
+                            break
+                if md:
+                    output_str = md
+                    break
+                if isinstance(out.get("output"), str) and len(out["output"]) > 100:
+                    output_str = out["output"]
+                    break
+
+    # 2. Fallback: largest string output across all non-ROOT nodes
+    if not output_str:
+        for node in reversed(nodes):
+            if node.get("id") == "ROOT":
+                continue
+            out = node.get("output", {})
+
+            def _find_largest_string(d):
+                largest = ""
+                for v in d.values():
+                    if isinstance(v, str):
+                        if len(v) > len(largest):
+                            largest = v
+                    elif isinstance(v, dict):
+                        sub = _find_largest_string(v)
+                        if len(sub) > len(largest):
+                            largest = sub
+                return largest
+
+            if isinstance(out, dict):
+                largest_str = _find_largest_string(out)
+                if len(largest_str) > 50:
+                    output_str = largest_str
+                    break
+            elif isinstance(out, str) and len(out) > 50:
+                output_str = out
+                break
+
+    # 3. Strip JSON wrapper / markdown fences if present
+    if output_str:
+        if (output_str.startswith("{") and output_str.endswith("}")) or (
+            output_str.startswith("[") and output_str.endswith("]")
+        ):
+            try:
+                parsed = json.loads(output_str)
+                if isinstance(parsed, dict):
+                    for k in ["markdown_report", "formatted_report", "output", "summary", "report"]:
+                        if parsed.get(k) and isinstance(parsed[k], str) and len(parsed[k]) > 50:
+                            output_str = parsed[k]
+                            break
+            except Exception:
+                pass
+        import re
+
+        output_str = re.sub(r"^```(?:markdown)?\n", "", output_str)
+        output_str = re.sub(r"\n```$", "", output_str)
+
+    return output_str.strip()
+
+
+# === Endpoints ===
+
+
+def _write_dry_run_session(run_id: str, query: str, user_id: str, space_id: Optional[str] = None) -> None:
+    """Write minimal session JSON for dry-run so list_runs finds it."""
+    import os
+
+    base_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+    today = datetime.now()
+    date_dir = base_dir / str(today.year) / f"{today.month:02d}" / f"{today.day:02d}"
+    date_dir.mkdir(parents=True, exist_ok=True)
+    session_file = date_dir / f"session_{run_id}.json"
+    graph_data = {
+        "nodes": [
+            {"id": "ROOT", "status": "completed", "agent": "System"},
+            {
+                "id": "DryRun",
+                "status": "completed",
+                "agent": "DryRunAgent",
+                "output": {"result": "Dry-run: no LLM called"},
+            },
+        ],
+        "links": [{"source": "ROOT", "target": "DryRun"}],
+        "directed": True,
+        "multigraph": False,
+        "graph": {
+            "session_id": run_id,
+            "original_query": query,
+            "created_at": datetime.now().isoformat(),
+            "status": "completed",
+            "globals": {"user_id": user_id or ""},
+        },
+    }
+    with open(session_file, "w", encoding="utf-8") as f:
+        json.dump(graph_data, f, indent=2, default=str, ensure_ascii=False)
+
+
+@router.post("/runs")
+async def create_run(request: RunRequest, background_tasks: BackgroundTasks):
+    import os
+
+    run_id = str(int(datetime.now().timestamp() * 1000))
+    user_id = get_current_user_id()
+
+    # Shared Space: verify user has access to the space (owner or shared-with)
+    if request.space_id:
+        try:
+            from memory.knowledge_graph import get_knowledge_graph
+
+            kg = get_knowledge_graph()
+            if kg and kg.enabled and not kg.can_user_access_space(user_id, request.space_id):
+                raise HTTPException(status_code=403, detail="You do not have access to this space")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    # Dry-run: skip agent, write synthetic session, return immediately (for automation)
+    dry_run = request.dry_run if request.dry_run is not None else (os.environ.get("DRY_RUN_RUNS", "").lower() == "true")
+    if dry_run:
+        _write_dry_run_session(run_id, request.query, user_id, request.space_id)
+        if request.space_id:
+            try:
+                from memory.knowledge_graph import get_knowledge_graph
+
+                kg = get_knowledge_graph()
+                if kg and kg.enabled:
+                    kg.get_or_create_session(run_id, space_id=request.space_id)
+            except Exception:
+                pass
+        return {
+            "id": run_id,
+            "status": "completed",
+            "created_at": datetime.now().isoformat(),
+            "query": request.query,
+        }
+
+    # Throttle: block new runs if hourly/daily cost budget exceeded
+    try:
+        from ops.admin.spans_repository import get_spans_collection
+        from ops.admin.throttle import ThrottlePolicy
+
+        coll = get_spans_collection()
+        policy = ThrottlePolicy(spans_collection=coll)
+        allowed, reason = policy.check_budget()
+        if not allowed:
+            with run_throttled_span(run_id, reason, request.query):
+                pass
+            force_flush()
+            raise HTTPException(status_code=429, detail=reason)
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # If throttle check fails (e.g. MongoDB down), allow run to proceed
+
+    # Start background execution (Phase 3C: pass space_id for session scoping)
+    background_tasks.add_task(
+        process_run, run_id, request.query, request.source, request.stream, None, request.space_id, user_id
+    )
+
+    return {"id": run_id, "status": "starting", "created_at": datetime.now().isoformat(), "query": request.query}
+
+
+@router.get("/runs")
+async def list_runs():
+    """List runs from disk"""
+    summaries_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+    runs = []
+
+    if summaries_dir.exists():
+        # Walk through date folders
+        for date_folder in summaries_dir.glob("*/*/*"):
+            for session_file in date_folder.glob("session_*.json"):
+                try:
+                    data = json.loads(session_file.read_text())
+                    graph_data = data
+                    # Extract meta
+                    graph_details = graph_data.get("graph", {})
+
+                    # Filter by User ID
+                    run_user_id = graph_details.get("globals", {}).get("user_id")
+                    current_user_id = get_current_user_id()
+                    if current_user_id and run_user_id and run_user_id != current_user_id:
+                        continue
+
+                    # Robust Query Extraction
+                    query = graph_details.get("original_query")
+                    if not query:
+                        query = graph_details.get("globals", {}).get("original_query", "Unknown Query")
+
+                    # Timestamp Extraction
+                    created_at = graph_details.get("created_at")
+                    if not created_at:
+                        # Fallback to file creation time
+                        created_at = datetime.fromtimestamp(session_file.stat().st_ctime).isoformat()
+
+                    # Compute status from node statuses
+                    nodes = data.get("nodes", [])
+                    node_statuses = [n.get("status", "pending") for n in nodes if n.get("id") != "ROOT"]
+
+                    # Stale detection: if file hasn't been modified in 5 minutes and still "running", mark failed
+                    file_age_seconds = time.time() - session_file.stat().st_mtime
+                    is_stale = file_age_seconds > 300  # 5 minutes
+
+                    if any(s == "running" for s in node_statuses):
+                        computed_status = "failed" if is_stale else "running"
+                    elif any(s == "failed" for s in node_statuses):
+                        computed_status = "failed"
+                    elif all(s in ("completed", "waiting_input") for s in node_statuses) and node_statuses:
+                        computed_status = "completed"
+                    else:
+                        # Fallback to graph-level status; mark stale runs as failed
+                        graph_status = graph_details.get("status", "completed")
+                        computed_status = "failed" if (is_stale and graph_status == "running") else graph_status
+
+                    total_tokens = sum((n.get("total_tokens", 0) or 0) for n in nodes)
+
+                    run_id = session_file.stem.replace("session_", "")
+                    run_source = graph_details.get("source", "web")
+                    runs.append(
+                        {
+                            "id": run_id,
+                            "query": query,
+                            "created_at": created_at,
+                            "status": computed_status,
+                            "total_tokens": total_tokens,
+                            "source": run_source,
+                        }
+                    )
+                except Exception:
+                    continue
+
+    # Phase 4: Enrich with space_id from Neo4j so frontend can filter by space
+    try:
+        from memory.knowledge_graph import get_knowledge_graph
+
+        kg = get_knowledge_graph()
+        if kg is not None:
+            for r in runs:
+                space_id = kg.get_space_for_session(r["id"])
+                r["space_id"] = space_id
+    except Exception:
+        pass
+
+    # Sort by recent
+    return sorted(runs, key=lambda x: x["id"], reverse=True)
+
+
+@router.get("/runs/{run_id}")
+async def get_run(run_id: str):
+    """Get graph state for a run"""
+    # Check memory first (if running)
+    # Then check disk
+
+    # Search disk
+    summaries_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+    found_file = None
+    current_user_id = get_current_user_id()
+
+    # Brute force search (should optimize path structure later)
+    for path in summaries_dir.rglob(f"session_{run_id}.json"):
+        found_file = path
+        break
+
+    if found_file:
+        data = json.loads(found_file.read_text())
+
+        # Enforce User ID filter
+        run_user_id = data.get("graph", {}).get("globals", {}).get("user_id")
+        if current_user_id and run_user_id and run_user_id != current_user_id:
+            raise HTTPException(status_code=403, detail="Not authorized to view this run")
+
+        # Reconstruct Graph to use adapter
+        import networkx as nx
+
+        if "edges" in data:
+            G = nx.node_link_graph(data, edges="edges")
+        elif "links" in data:
+            G = nx.node_link_graph(data, edges="links")
+        elif "link" in data:
+            # networkx default uses 'link' (singular)
+            G = nx.node_link_graph(data, edges="link")
+        else:
+            data["edges"] = []
+            G = nx.node_link_graph(data, edges="edges")
+        react_flow = nx_to_reactflow(G)
+
+        # Determine status: Running if in memory, else use file status
+        # Apply same stale detection as list_runs() — 5 minute timeout
+        if run_id in active_loops:
+            status = "running"
+        else:
+            file_status = data.get("graph", {}).get("status", "completed")
+            if file_status == "running":
+                file_age = time.time() - found_file.stat().st_mtime
+                status = "failed" if file_age > 300 else "running"
+            else:
+                status = file_status
+
+        return {"id": run_id, "status": status, "graph": react_flow}
+
+    raise HTTPException(status_code=404, detail="Run not found")
+
+
+@router.get("/runs/{run_id}/output")
+async def get_run_output(run_id: str):
+    """Return the extracted text output of a completed run.
+
+    Designed for programmatic consumers (e.g. the Nexus channel gateway) that
+    need the final agent reply as plain text rather than the ReactFlow graph.
+
+    Returns:
+        {
+            "run_id": str,
+            "status": "running" | "completed" | "failed" | "not_found",
+            "output": str | None
+        }
+    """
+    # Still running — no output yet
+    if run_id in active_loops:
+        return {"run_id": run_id, "status": "running", "output": None}
+
+    # Search disk for the saved session
+    summaries_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+    found_file = None
+    for path in summaries_dir.rglob(f"session_{run_id}.json"):
+        found_file = path
+        break
+
+    if not found_file:
+        return {"run_id": run_id, "status": "not_found", "output": None}
+
+    data = json.loads(found_file.read_text())
+
+    # Determine overall run status from node statuses
+    nodes = data.get("nodes", [])
+    node_statuses = [n.get("status", "pending") for n in nodes if n.get("id") != "ROOT"]
+    if any(s == "failed" for s in node_statuses):
+        run_status = "failed"
+    else:
+        run_status = data.get("graph", {}).get("status", "completed")
+
+    output_str = _extract_output_str(data)
+
+    return {
+        "run_id": run_id,
+        "status": run_status,
+        "output": output_str if output_str else None,
+    }
+
+
+@router.post("/runs/{run_id}/input")
+async def provide_input(run_id: str, request: UserInputRequest):
+    """Provide user input to a running agent (e.g., ClarificationAgent response)"""
+    if run_id in active_loops:
+        loop = active_loops[run_id]
+        if loop.context:
+            try:
+                # Find the ClarificationAgent node that's awaiting input
+                for node_id, node_data in loop.context.plan_graph.nodes(data=True):
+                    if node_data.get("agent") == "ClarificationAgent" and node_data.get("status") in [
+                        "running",
+                        "waiting_input",
+                    ]:
+                        # Get the writes key for this clarification
+                        writes = node_data.get("writes", ["user_clarification"])
+                        write_key = writes[0] if writes else "user_clarification"
+
+                        # Store user input in globals_schema
+                        loop.context.plan_graph.graph.setdefault("globals_schema", {})[write_key] = request.response
+
+                        # Mark the clarification step as completed with user's response as output
+                        loop.context.plan_graph.nodes[node_id]["output"] = {
+                            "clarificationMessage": "User provided clarification",
+                            write_key: request.response,
+                        }
+                        loop.context.plan_graph.nodes[node_id]["status"] = "completed"
+
+                        # Save the session
+                        loop.context._save_session()
+
+                        return {"id": run_id, "status": "input_received", "stored_as": write_key}
+
+                # No running ClarificationAgent found
+                raise HTTPException(status_code=400, detail="No ClarificationAgent is currently waiting for input")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error processing input: {str(e)}")
+        else:
+            raise HTTPException(status_code=400, detail="Context not initialized")
+
+    raise HTTPException(status_code=404, detail="Active run not found")
+
+
+@router.post("/runs/{run_id}/stop")
+async def stop_run(run_id: str):
+    """Stop a running agent execution.
+
+    If the run is actively in memory, stop its loop.
+    If it's a stale run (e.g. after restart), mark its session file as failed.
+    """
+    # Try live stop first
+    if run_id in active_loops:
+        loop = active_loops[run_id]
+        loop.stop()
+        return {"id": run_id, "status": "stopping"}
+
+    # Stale run — not in active_loops (server restarted). Mark as failed on disk.
+    summaries_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+    for session_file in summaries_dir.rglob(f"session_{run_id}.json"):
+        try:
+            data = json.loads(session_file.read_text())
+            dirty = False
+            graph = data.get("graph", {})
+            if graph.get("status") == "running":
+                graph["status"] = "failed"
+                data["graph"] = graph
+                dirty = True
+            for node in data.get("nodes", []):
+                if node.get("status") == "running":
+                    node["status"] = "failed"
+                    dirty = True
+            if dirty:
+                session_file.write_text(json.dumps(data))
+            return {"id": run_id, "status": "failed"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to stop stale run: {e}")
+
+    raise HTTPException(status_code=404, detail="Run not found")
+
+
+@router.delete("/runs/{run_id}")
+async def delete_run(run_id: str):
+    """Delete a run from disk and memory"""
+    # Verify ownership before deleting
+    current_user_id = get_current_user_id()
+    summaries_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+    found_file = None
+
+    for path in summaries_dir.rglob(f"session_{run_id}.json"):
+        found_file = path
+        break
+
+    if found_file:
+        data = json.loads(found_file.read_text())
+        run_user_id = data.get("graph", {}).get("globals", {}).get("user_id")
+        if current_user_id and run_user_id and run_user_id != current_user_id:
+            raise HTTPException(status_code=403, detail="Not authorized to delete this run")
+
+    # 1. Stop if running
+    if run_id in active_loops:
+        loop = active_loops[run_id]
+        loop.stop()
+        del active_loops[run_id]
+
+    # 2. Delete file
+    deleted = False
+
+    # Brute force search
+    for path in summaries_dir.rglob(f"session_{run_id}.json"):
+        try:
+            path.unlink()
+            deleted = True
+            break
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
+
+    if not deleted and run_id not in active_loops:  # If wasn't running and file not found
+        # Might be okay if it was just in memory? But we are memory-less persistence mostly
+        # Let's return success if we stopped it at least, or warn
+        pass
+
+    return {"id": run_id, "status": "deleted"}
+
+
+# === AGENT TESTING ENDPOINTS ===
+
+
+class AgentTestRequest(BaseModel):
+    input: Optional[str] = None
+
+
+@router.post("/runs/{run_id}/agent/{node_id}/test")
+async def test_agent(run_id: str, node_id: str, request: AgentTestRequest = Body(None)):
+    """
+    Re-run a single agent in TEST MODE (sandbox).
+    - Loads the session
+    - Extracts the node's inputs from globals_schema
+    - Runs the agent with those inputs
+    - Returns the NEW output WITHOUT saving to session
+    """
+    try:
+        with run_span(run_id, f"agent_test:{node_id}"):
+            # 1. Find the session file
+            summaries_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+            found_file = None
+            for path in summaries_dir.rglob(f"session_{run_id}.json"):
+                found_file = path
+                break
+
+            if not found_file:
+                raise HTTPException(status_code=404, detail="Session not found")
+
+            # 2. Load session data
+            import networkx as nx
+
+            session_data = json.loads(found_file.read_text())
+            if "edges" in session_data:
+                G = nx.node_link_graph(session_data, edges="edges")
+            elif "links" in session_data:
+                G = nx.node_link_graph(session_data, edges="links")
+            elif "link" in session_data:
+                G = nx.node_link_graph(session_data, edges="link")
+            else:
+                session_data["edges"] = []
+                G = nx.node_link_graph(session_data, edges="edges")
+
+            # 3. Find the node
+            if node_id not in G.nodes:
+                raise HTTPException(status_code=404, detail=f"Node {node_id} not found in session")
+
+            node_data = G.nodes[node_id]
+            agent_type = node_data.get("agent")
+
+            if not agent_type:
+                raise HTTPException(status_code=400, detail="Node has no agent type")
+
+            # 4. Collect inputs from globals_schema based on 'reads'
+            globals_schema = G.graph.get("globals_schema", {})
+            reads = node_data.get("reads", [])
+            inputs = {key: globals_schema.get(key) for key in reads if key in globals_schema}
+
+            # 5. Build the input payload helper
+            def build_agent_input(instruction=None, previous_output=None, iteration_context=None):
+                # Determine base values
+                prompt_to_use = instruction or node_data.get("agent_prompt", node_data.get("description", ""))
+                query_to_use = G.graph.get("original_query", "")
+
+                # Apply overrides from request if present
+                if request and request.input:
+                    if agent_type == "PlannerAgent":
+                        query_to_use = request.input
+                    else:
+                        # For downstream agents, the input overrides the instruction/goal
+                        prompt_to_use = request.input
+
+                payload = {
+                    "step_id": node_id,
+                    "agent_prompt": prompt_to_use,
+                    "reads": reads,
+                    "writes": node_data.get("writes", []),
+                    "inputs": inputs,
+                    "original_query": query_to_use,
+                    "session_context": {
+                        "session_id": run_id,
+                        "created_at": G.graph.get("created_at", ""),
+                        "file_manifest": G.graph.get("file_manifest", []),
+                    },
+                    **({"previous_output": previous_output} if previous_output else {}),
+                    **({"iteration_context": iteration_context} if iteration_context else {}),
+                }
+                # Formatter-specific additions
+                if agent_type == "FormatterAgent":
+                    global_data = G.graph.get("globals_schema", {}).copy()
+                    print(f"🕵️‍♂️ DEBUG FORMATTER: run_id={run_id}")
+                    print(f"🕵️‍♂️ DEBUG FORMATTER: file={found_file}")
+                    print(f"🕵️‍♂️ DEBUG FORMATTER: globals_keys={list(global_data.keys())}")
+                    if "formatted_report_T010" in global_data:
+                        print(f"🕵️‍♂️ DEBUG FORMATTER: FOUND STALE KEY 'formatted_report_T010'!")
+                    payload["all_globals_schema"] = global_data
+                return payload
+
+            # 6. Execute with ReAct Loop (Max 15 turns)
+            from agents.base_agent import AgentRunner
+            from memory.context import ExecutionContextManager
+
+            agent_runner = AgentRunner(multi_mcp)
+            temp_context = ExecutionContextManager.__new__(ExecutionContextManager)
+            temp_context.plan_graph = G
+            temp_context.multi_mcp = multi_mcp
+
+            max_turns = 15
+            current_input = build_agent_input()
+            iterations_data = []
+            final_output = {}
+            final_execution_result = None
+
+            with agent_execute_node_span(node_id, agent_type, run_id):
+                for turn in range(1, max_turns + 1):
+                    print(f"🔄 Test Mode: {agent_type} Iteration {turn}/{max_turns}")
+
+                    # Run Agent
+                    result = await agent_runner.run_agent(agent_type, current_input)
+
+                    if not result["success"]:
+                        return {
+                            "status": "error",
+                            "error": result.get("error", "Agent execution failed"),
+                            "node_id": node_id,
+                            "agent_type": agent_type,
+                        }
+
+                    output = result["output"]
+                    final_output = output  # Update final output
+                    iterations_data.append({"iteration": turn, "output": output})
+
+                    # 1. Check for 'call_tool' (ReAct)
+                    if output.get("call_tool"):
+                        tool_call = output["call_tool"]
+                        tool_name = tool_call.get("name")
+                        tool_args = tool_call.get("arguments", {})
+
+                        print(f"🛠️ Test Mode: Executing Tool: {tool_name}")
+
+                        try:
+                            # Execute tool via MultiMCP
+                            tool_result = await multi_mcp.route_tool_call(tool_name, tool_args)
+
+                            # Serialize result content
+                            if isinstance(tool_result.content, list):
+                                result_str = "\n".join(
+                                    [str(item.text) for item in tool_result.content if hasattr(item, "text")]
+                                )
+                            else:
+                                result_str = str(tool_result.content)
+
+                            # Save result to history
+                            iterations_data[-1]["tool_result"] = result_str
+
+                            # Prepare input for next iteration
+                            instruction = output.get("thought", "Use the tool result to generate the final output.")
+                            if turn == max_turns - 1:
+                                instruction += " \n\n⚠️ WARNING: This is your FINAL turn. You MUST provide the final 'output' now. Do not call any more tools. Summarize what you have."
+
+                            current_input = build_agent_input(
+                                instruction=instruction,
+                                previous_output=output,
+                                iteration_context={"tool_result": result_str},
+                            )
+                            continue  # Loop to next turn
+
+                        except Exception as e:
+                            print(f"Test Mode: Tool Execution Failed: {e}")
+                            current_input = build_agent_input(
+                                instruction="The tool execution failed. Try a different approach or tool.",
+                                previous_output=output,
+                                iteration_context={"tool_result": f"Error: {str(e)}"},
+                            )
+                            continue
+
+                    # 2. Check for call_self (Legacy/Advanced recursion)
+                    elif output.get("call_self"):
+                        # Handle code execution if needed
+                        if temp_context._has_executable_code(output):
+                            # Pass 'inputs' as overrides so variables from prev iterations (like ipl_urls_1A) are available
+                            execution_result = await temp_context._auto_execute_code(
+                                node_id, output, input_overrides=inputs
+                            )
+                            final_execution_result = execution_result
+
+                            # Save result to history
+                            iterations_data[-1]["execution_result"] = execution_result
+
+                            if execution_result.get("status") == "success":
+                                execution_data = execution_result.get("result", {})
+                                inputs = {**inputs, **execution_data}  # Update inputs for next iteration
+
+                        # Prepare input for next iteration
+                        current_input = build_agent_input(
+                            instruction=output.get("next_instruction", "Continue the task"),
+                            previous_output=output,
+                            iteration_context=output.get("iteration_context", {}),
+                        )
+                        continue
+
+                    # 3. Success (No tool call, just output)
+                    else:
+                        # Execute code if present (Final Iteration)
+                        if temp_context._has_executable_code(output):
+                            # Pass 'inputs' as overrides here too
+                            final_execution_result = await temp_context._auto_execute_code(
+                                node_id, output, input_overrides=inputs
+                            )
+                            iterations_data[-1]["execution_result"] = final_execution_result
+                            if final_execution_result:
+                                final_output = temp_context._merge_execution_results(output, final_execution_result)
+                        break  # Exit loop
+
+            # 8. Get the original output for comparison
+            original_output = node_data.get("output", {})
+
+            # Ensure final_execution_result is passed even if loop broke early
+            if not final_execution_result and iterations_data:
+                final_execution_result = iterations_data[-1].get("execution_result")
+
+            return {
+                "status": "success",
+                "node_id": node_id,
+                "agent_type": agent_type,
+                "original_output": original_output,
+                "test_output": final_output,
+                "execution_result": final_execution_result,
+                "inputs_used": inputs,
+                "iterations": iterations_data,  # Optional: Pass full iterations if needed by UI
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/runs/{run_id}/agent/{node_id}/save")
+async def save_agent_test(run_id: str, node_id: str, request: Request):
+    """
+    Save test results back to the session file.
+    - Updates the node's output
+    - Updates globals_schema with new writes
+    """
+    try:
+        body = await request.json()
+        new_output = body.get("output")
+
+        if not new_output:
+            raise HTTPException(status_code=400, detail="Missing 'output' in request body")
+
+        # 1. Find the session file
+        summaries_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+        found_file = None
+        for path in summaries_dir.rglob(f"session_{run_id}.json"):
+            found_file = path
+            break
+
+        if not found_file:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # 2. Load and update session
+        import networkx as nx
+
+        session_data = json.loads(found_file.read_text())
+        if "edges" in session_data:
+            G = nx.node_link_graph(session_data, edges="edges")
+        elif "links" in session_data:
+            G = nx.node_link_graph(session_data, edges="links")
+        elif "link" in session_data:
+            G = nx.node_link_graph(session_data, edges="link")
+        else:
+            session_data["edges"] = []
+            G = nx.node_link_graph(session_data, edges="edges")
+
+        if node_id not in G.nodes:
+            raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+
+        # 2.5 SPECIAL HANDLING: PlannerAgent Graph Update
+        # If this is a PlannerAgent (has plan_graph in output), we must REBUILD the graph structure.
+        if "plan_graph" in new_output:
+            print(f"🔄 Planner Update Detected for {node_id}. Rebuilding graph...")
+            plan_graph = new_output["plan_graph"]
+
+            # 1. Keep crucial nodes (ROOT and the Planner/Query node itself)
+            # We assume node_id is the Planner node.
+            nodes_to_keep = ["ROOT", node_id]
+
+            # 2. Identify nodes to remove (all existing nodes except kept ones)
+            nodes_to_remove = [n for n in G.nodes if n not in nodes_to_keep]
+            for n in nodes_to_remove:
+                G.remove_node(n)
+
+            # 3. Add NEW nodes from plan
+            # plan_graph['nodes'] is a list of dicts
+            new_nodes = plan_graph.get("nodes", [])
+            for n_data in new_nodes:
+                nid = n_data["id"]
+                # Ensure we don't overwrite the planner if it's in the list for some reason (unlikely but safe)
+                if nid not in G.nodes:
+                    G.add_node(nid, **n_data)
+                    # Initialize status for new nodes
+                    G.nodes[nid]["status"] = "idle"
+
+            # 4. Add NEW edges from plan
+            # plan_graph['edges'] or 'links'
+            new_edges = plan_graph.get("edges", plan_graph.get("links", []))
+
+            # clear existing edges? We already removed nodes, so connected edges are gone.
+            # But we need to ensure ROOT -> Planner connection exists if not implicitly handled.
+            # In our schema, ROOT->Query (Planner).
+            # The plan_graph usually defines edges from "ROOT" to the first new node.
+            # We must REMAP "ROOT" in the plan to be "node_id" (The Planner Node)
+            # so that the flow is ROOT -> Planner -> FirstNode
+
+            for edge in new_edges:
+                src = edge["source"]
+                tgt = edge["target"]
+
+                # REMAP ROOT -> Current Planner Node
+                if src == "ROOT":
+                    src = node_id
+
+                G.add_edge(src, tgt)
+
+            # Ensure ROOT is connected to Planner (node_id)
+            if not G.has_edge("ROOT", node_id):
+                G.add_edge("ROOT", node_id)
+
+            print(f"✅ Graph Rebuilt. Nodes: {len(G.nodes)}, Edges: {len(G.edges)}")
+
+        node_data = G.nodes[node_id]
+        writes = node_data.get("writes", [])
+
+        # 3. Update node output
+        node_data["output"] = new_output
+        node_data["last_tested"] = datetime.now().isoformat()
+        node_data["status"] = "completed"
+
+        # 4. Update globals_schema with execution results if available
+        # 4. Update globals_schema
+        # CRITICAL FIX: Prioritize the 'merged' output (new_output) which contains the actual results
+        # Execution result is less reliable as it might be raw or unmerged
+
+        globals_schema = G.graph.get("globals_schema", {})
+
+        # 1. Try extracting from new_output (which is test_output from frontend = merged result)
+        if isinstance(new_output, dict):
+            for key in writes:
+                if key in new_output:
+                    # Validate it's not just an empty placeholder if possible, but trust the save
+                    val = new_output[key]
+                    # If it's a list and not empty, or dict and not empty, update
+                    if val or val == 0 or val is False:
+                        globals_schema[key] = val
+
+        # 2. Fallback to execution_result only if new_output didn't have it
+        exec_result = body.get("execution_result")
+        if exec_result and isinstance(exec_result, dict):
+            result_data = exec_result.get("result", exec_result)  # Handle {status:..., result:...} or direct
+
+            for key in writes:
+                if key not in globals_schema or not globals_schema[key]:  # Only if missing/empty
+                    if isinstance(result_data, dict) and key in result_data:
+                        globals_schema[key] = result_data[key]
+
+        G.graph["globals_schema"] = globals_schema
+
+        # 5. Update iterations array with execution_result if provided
+        execution_result = body.get("execution_result")
+        if execution_result:
+            # Check if iterations exist, if not create a default one
+            if not node_data.get("iterations"):
+                node_data["iterations"] = []
+
+            iterations = node_data["iterations"]
+
+            if iterations:
+                # Update the last iteration with the new execution result
+                iterations[-1]["execution_result"] = execution_result
+            else:
+                # Create a pseudo-iteration if none exist (e.g. single-shot agents)
+                iterations.append({"iteration": 1, "output": new_output, "execution_result": execution_result})
+
+        # 5.5. Cascading Invalidation: Mark downstream nodes as 'stale'
+        # This gives visual feedback (muted opacity) in the frontend that these nodes need re-running
+        try:
+            descendants = nx.descendants(G, node_id)
+            for desc_id in descendants:
+                if desc_id in G.nodes:
+                    # Only mark as stale if they were previously completed or failed
+                    # If they are 'pending', they stay pending.
+                    current_status = G.nodes[desc_id].get("status")
+                    if current_status in ["completed", "failed", "running"]:
+                        G.nodes[desc_id]["status"] = "stale"
+        except Exception as e:
+            print(f"Warning: Failed to invalidate downstream nodes: {e}")
+
+        # 6. Save back to file
+        # Use edges="edges" to match our expected format (not default "link")
+        graph_data = nx.node_link_data(G, edges="edges")
+        with open(found_file, "w", encoding="utf-8") as f:
+            json.dump(graph_data, f, indent=2, default=str, ensure_ascii=False)
+
+        # 7. AUTO-SAVE TO NOTES (for FormatterAgent "Run Again" saves)
+        agent_type = G.nodes[node_id].get("agent", "")
+        if agent_type == "FormatterAgent" and isinstance(new_output, dict):
+            try:
+                import re
+
+                notes_dir = PROJECT_ROOT / "data" / "Notes" / "Arcturus"
+                notes_dir.mkdir(parents=True, exist_ok=True)
+
+                def sanitize_filename(title):
+                    title = re.sub(r'[\\/*?:"<>|#]', "", title)
+                    title = title.replace("\n", " ").strip()
+                    return title[:60].strip()
+
+                def extract_title(content):
+                    match = re.search(r"^#+\s+(.+)$", content, re.MULTILINE)
+                    if match:
+                        return match.group(1).strip()
+                    lines = [l.strip() for l in content.split("\n") if l.strip()]
+                    return lines[0] if lines else "Untitled Report"
+
+                markdown = new_output.get("markdown_report")
+                if not markdown:
+                    for k, v in new_output.items():
+                        if k.startswith("formatted_report") and isinstance(v, str):
+                            markdown = v
+                            break
+
+                if markdown and len(markdown) > 100:
+                    title = extract_title(markdown)
+                    filename = sanitize_filename(title) + ".md"
+                    target_path = notes_dir / filename
+
+                    # Write or overwrite (Run Again means user explicitly wants new version)
+                    with open(target_path, "w", encoding="utf-8") as f:
+                        f.write(markdown)
+                    print(f"✅ Auto-Saved (Run Again) to Notes: {filename}")
+
+            except Exception as e:
+                print(f"⚠️ Failed to auto-save to Notes: {e}")
+
+        return {"status": "success", "node_id": node_id, "message": "Test results saved to session"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/runs/{run_id}/nodes/{node_id}/execute")
+async def execute_node(run_id: str, node_id: str, request: ExecuteNodeRequest, background_tasks: BackgroundTasks):
+    """
+    Execute graph starting from a specific node or just remaining nodes.
+    Updates the session file and triggers background resume.
+    """
+    try:
+        # 1. Find the session file
+        summaries_dir = PROJECT_ROOT / "memory" / "session_summaries_index"
+        found_file = None
+        for path in summaries_dir.rglob(f"session_{run_id}.json"):
+            found_file = path
+            break
+
+        if not found_file:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # 2. Load session data
+        import networkx as nx
+
+        session_data = json.loads(found_file.read_text())
+
+        # Determine edge key
+        edge_key = "edges"
+        if "links" in session_data:
+            edge_key = "links"
+        elif "link" in session_data:
+            edge_key = "link"
+
+        if edge_key not in session_data:
+            session_data[edge_key] = []
+
+        G = nx.node_link_graph(session_data, edges=edge_key)
+
+        if node_id not in G.nodes and request.mode != "remaining":
+            # If mode is remaining, node_id might just be context, but let's be strict
+            if node_id != "ROOT":
+                raise HTTPException(status_code=404, detail=f"Node {node_id} not found in session")
+
+        # 3. Determine nodes to reset
+        nodes_to_reset = set()
+
+        if request.mode == "remaining":
+            # Find all descendants of the current node (if provided) that are NOT completed?
+            # actually "remaining" usually implies "pending" nodes.
+            # But here we want to force re-run of downstream nodes.
+            # So find descendants of node_id
+            if node_id and node_id != "ROOT":
+                descendants = nx.descendants(G, node_id)
+                nodes_to_reset.update(descendants)
+            else:
+                # If no node_id, just resume (no reset)? Or reset failed/interrupted?
+                pass
+
+        elif request.mode == "all_from_here":
+            # Reset this node AND all descendants
+            nodes_to_reset.add(node_id)
+            descendants = nx.descendants(G, node_id)
+            nodes_to_reset.update(descendants)
+
+        elif request.mode == "single":
+            # Just reset this node
+            nodes_to_reset.add(node_id)
+
+        elif request.mode == "all":
+            # Reset ALL nodes except ROOT/Query? Or just restart?
+            # Better to just mark all as pending
+            nodes_to_reset.update(G.nodes)
+            if "ROOT" in nodes_to_reset:
+                nodes_to_reset.remove("ROOT")
+
+        # 4. Apply Resets
+        reset_count = 0
+        for n_id in nodes_to_reset:
+            if n_id in G.nodes:
+                G.nodes[n_id]["status"] = "pending"
+                # Clear output? Maybe not strictly required as it will be overwritten,
+                # but good to clear error states
+                if "error" in G.nodes[n_id]:
+                    del G.nodes[n_id]["error"]
+                reset_count += 1
+
+        # 5. Save Session
+        updated_data = nx.node_link_data(G, edges=edge_key)
+        # Ensure top-level metadata persists
+        for k, v in session_data.items():
+            if k not in updated_data:
+                updated_data[k] = v
+
+        found_file.write_text(json.dumps(updated_data, indent=2))
+
+        # 6. Trigger Background Resume
+        background_tasks.add_task(process_resume, run_id, found_file)
+
+        return {"status": "resuming", "reset_count": reset_count, "mode": request.mode}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

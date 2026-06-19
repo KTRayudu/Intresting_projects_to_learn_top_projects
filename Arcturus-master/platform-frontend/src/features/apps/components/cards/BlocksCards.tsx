@@ -1,0 +1,1458 @@
+/**
+ * Blocks.so Components - Free shadcn/ui blocks adapted for App Builder
+ * Source: https://blocks.so/
+ * 
+ * These are adapted from blocks.so to work as draggable App Builder cards
+ * with dynamic data binding via the data prop.
+ */
+
+import React from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { cn } from '@/lib/utils';
+import { TrendingUp, TrendingDown, ArrowRight } from 'lucide-react';
+import { AutoHeightWrapper } from './AutoHeightWrapper';
+
+// ============================================================================
+// STATS-01: Stats with Trending
+// Source: https://blocks.so/stats#stats-01
+// ============================================================================
+
+// Enhanced StatItem with flexible schema support
+// Enhanced StatItem with flexible schema support
+interface StatItem {
+    name?: string;
+    label?: string; // AI often generates 'label'
+    value?: string;
+    change?: string;
+    changeType?: 'positive' | 'negative' | 'neutral';
+    description?: string; // AI often generates 'description'
+    icon?: string; // AI often generates 'icon'
+    status?: 'success' | 'warning' | 'error' | 'info'; // For status cards
+    statusText?: string;
+}
+
+interface StatsTrendingCardProps {
+    title?: string;
+    data?: {
+        title?: string;
+        description?: string;
+        stats?: StatItem[];
+        items?: StatItem[]; // AI sometimes uses 'items'
+    };
+    config?: {
+        showTitle?: boolean;
+        showChange?: boolean;
+    };
+    style?: any;
+    cardId?: string;
+    autoFit?: boolean;
+    context?: string;
+}
+
+const defaultStats: StatItem[] = [
+    { name: 'Profit', value: '$287,654', change: '+8.32%', changeType: 'positive' },
+    { name: 'Late payments', value: '$9,435', change: '-12.64%', changeType: 'negative' },
+    { name: 'Pending orders', value: '$173,229', change: '+2.87%', changeType: 'positive' },
+];
+
+// Helper to normalize stat item
+const normalizeStat = (item: any): StatItem => ({
+    ...item,
+    name: item.name || item.label || 'Unknown',
+    value: item.value || '', // Allow empty value
+    change: item.change || '',
+    changeType: item.changeType || 'neutral',
+    description: item.description || '',
+    icon: item.icon || '',
+    status: item.status || 'info',
+    statusText: item.statusText || item.status || 'Info'
+});
+
+export const StatsTrendingCard: React.FC<StatsTrendingCardProps> = ({
+    title: propTitle,
+    data = {},
+    config = {},
+    style = {},
+    cardId,
+    autoFit,
+    context
+}) => {
+    const titleVal = data.title || propTitle || 'Key Metrics';
+    const showTitle = config.showTitle !== false;
+    const showChange = config.showChange !== false;
+    // Handle both 'stats' and 'items'
+    const rawStats = data.stats || data.items || defaultStats;
+    const stats = rawStats.map(normalizeStat);
+
+    const content = (
+        <div className="h-full flex flex-col p-4">
+            {showTitle && (
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-3 flex items-center gap-2">
+                    <TrendingUp className="w-3.5 h-3.5 text-primary" />
+                    {titleVal}
+                </h3>
+            )}
+            <div className="grid grid-cols-1 gap-3 flex-1 overflow-auto">
+                {stats.map((stat, index) => (
+                    <div
+                        key={index}
+                        className="p-3 rounded-lg bg-muted border border-border"
+                    >
+                        <div className="flex items-start justify-between gap-2 mb-1">
+                            <div className="flex flex-col">
+                                <span className="text-xs font-medium text-muted-foreground">{stat.name}</span>
+                                {stat.description && (
+                                    <span className="text-xs text-muted-foreground/70 mt-0.5 line-clamp-2">{stat.description}</span>
+                                )}
+                            </div>
+                            {showChange && stat.change && (
+                                <span className={cn(
+                                    "text-xs font-medium shrink-0",
+                                    stat.changeType === 'positive' ? "text-green-400" :
+                                        stat.changeType === 'negative' ? "text-red-400" : "text-muted-foreground"
+                                )}>
+                                    {stat.change}
+                                </span>
+                            )}
+                        </div>
+                        {stat.value && (
+                            <div className="text-xl font-bold text-foreground mt-1">{stat.value}</div>
+                        )}
+                    </div>
+                ))}
+            </div>
+        </div>
+
+    );
+
+    if (cardId && autoFit) {
+        return <AutoHeightWrapper cardId={cardId} enabled={autoFit}>{content}</AutoHeightWrapper>;
+    }
+    return content;
+};
+
+// ============================================================================
+// STATS-03: Stats with Card Layout
+// Source: https://blocks.so/stats#stats-03
+// ============================================================================
+
+interface StatsGridCardProps {
+    title?: string;
+    data?: {
+        title?: string;
+        description?: string;
+        stats?: StatItem[];
+        items?: StatItem[];
+    };
+    config?: {
+        showTitle?: boolean;
+        columns?: 2 | 3 | 4;
+    };
+    style?: any;
+    cardId?: string;
+    autoFit?: boolean;
+    context?: string;
+}
+
+const defaultGridStats: StatItem[] = [
+    { name: 'Unique visitors', value: '10,450', change: '-12.5%', changeType: 'negative' },
+    { name: 'Bounce rate', value: '56.1%', change: '+1.8%', changeType: 'positive' },
+    { name: 'Visit duration', value: '5.2min', change: '+19.7%', changeType: 'positive' },
+    { name: 'Conversion rate', value: '3.2%', change: '-2.4%', changeType: 'negative' },
+];
+
+export const StatsGridCard: React.FC<StatsGridCardProps> = ({
+    title: propTitle,
+    data = {},
+    config = {},
+    style = {},
+    cardId,
+    autoFit,
+    context
+}) => {
+    const titleVal = data.title || propTitle || 'Analytics Overview';
+    const showTitle = config.showTitle !== false;
+    const columns = config.columns || 2;
+    const rawStats = data.stats || data.items || defaultGridStats;
+    const stats = rawStats.map(normalizeStat);
+
+    const content = (
+        <div className="h-full flex flex-col p-4">
+            {showTitle && (
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-3">
+                    {titleVal}
+                </h3>
+            )}
+            <div className={cn(
+                "grid gap-3 flex-1 overflow-auto",
+                columns === 2 && "grid-cols-2",
+                columns === 3 && "grid-cols-3",
+                columns === 4 && "grid-cols-4"
+            )}>
+                {stats.map((item, index) => (
+                    <Card key={index} className="p-4 py-3 bg-muted border-border">
+                        <CardContent className="p-0">
+                            <div className="flex flex-col h-full justify-between">
+                                <div>
+                                    <dt className="text-xs font-medium text-muted-foreground mb-1">{item.name}</dt>
+                                    {item.description && (
+                                        <p className="text-xs text-muted-foreground/70 mb-2 line-clamp-2">{item.description}</p>
+                                    )}
+                                </div>
+                                <dd className="flex items-baseline space-x-2 mt-auto">
+                                    {item.value && <span className="text-2xl font-semibold text-foreground">{item.value}</span>}
+                                    {item.change && (
+                                        <span className={cn(
+                                            "text-xs font-medium",
+                                            item.changeType === 'positive' ? "text-green-400" :
+                                                item.changeType === 'negative' ? "text-red-400" : "text-muted-foreground"
+                                        )}>
+                                            {item.change}
+                                        </span>
+                                    )}
+                                </dd>
+                            </div>
+                        </CardContent>
+                    </Card>
+                ))}
+            </div>
+        </div>
+
+    );
+
+    if (cardId && autoFit) {
+        return <AutoHeightWrapper cardId={cardId} enabled={autoFit}>{content}</AutoHeightWrapper>;
+    }
+    return content;
+};
+
+// ============================================================================
+// STATS-06: Stats with Status Badges
+// Source: https://blocks.so/stats#stats-06
+// ============================================================================
+
+interface StatsStatusCardProps {
+    title?: string;
+    data?: {
+        title?: string;
+        description?: string;
+        stats?: StatItem[];
+        items?: StatItem[];
+    };
+    config?: {
+        showTitle?: boolean;
+    };
+    style?: any;
+    cardId?: string;
+    autoFit?: boolean;
+    context?: string;
+}
+
+const defaultStatusStats: StatItem[] = [
+    { name: 'API Uptime', value: '99.9%', status: 'success', statusText: 'Operational' },
+    { name: 'Response Time', value: '142ms', status: 'success', statusText: 'Normal' },
+    { name: 'Error Rate', value: '0.4%', status: 'warning', statusText: 'Elevated' },
+    { name: 'Active Users', value: '2,847', status: 'info', statusText: 'Online' },
+];
+
+const statusStyles = {
+    success: 'bg-green-500/15 text-green-400 border-0',
+    warning: 'bg-amber-500/15 text-amber-400 border-0',
+    error: 'bg-red-500/15 text-red-400 border-0',
+    info: 'bg-blue-500/15 text-blue-400 border-0',
+};
+
+export const StatsStatusCard: React.FC<StatsStatusCardProps> = ({
+    title: propTitle,
+    data = {},
+    config = {},
+    style = {},
+    cardId,
+    autoFit,
+    context
+}) => {
+    const titleVal = data.title || propTitle || 'System Status';
+    const showTitle = config.showTitle !== false;
+    const rawStats = data.stats || data.items || defaultStatusStats;
+    const stats = rawStats.map(normalizeStat);
+
+    const content = (
+        <div className="h-full flex flex-col p-4">
+            {showTitle && (
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-3">
+                    {titleVal}
+                </h3>
+            )}
+            <div className="grid grid-cols-2 gap-3 flex-1 overflow-auto">
+                {stats.map((item, index) => (
+                    <div key={index} className="p-3 rounded-lg bg-muted border border-border">
+                        <div className="flex items-center justify-between mb-2">
+                            <span className="text-xs font-medium text-muted-foreground">{item.name}</span>
+                            {item.status && (
+                                <Badge variant="outline" className={statusStyles[item.status as keyof typeof statusStyles] || statusStyles['info']}>
+                                    {item.statusText}
+                                </Badge>
+                            )}
+                        </div>
+                        {item.value && <div className="text-2xl font-bold text-foreground">{item.value}</div>}
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+
+    if (cardId && autoFit) {
+        return <AutoHeightWrapper cardId={cardId} enabled={autoFit}>{content}</AutoHeightWrapper>;
+    }
+    return content;
+};
+
+// ============================================================================
+// SIMPLE TABLE CARD
+// Adapted from blocks.so/tables with simplified structure
+// ============================================================================
+
+interface SimpleTableRow {
+    cells: string[];
+    status?: 'success' | 'warning' | 'error' | 'default';
+}
+
+interface SimpleTableCardProps {
+    title?: string;
+    data?: {
+        title?: string;
+        description?: string;
+        headers?: string[];
+        rows?: SimpleTableRow[];
+    };
+    config?: {
+        showTitle?: boolean;
+        striped?: boolean;
+    };
+    style?: any;
+    cardId?: string;
+    autoFit?: boolean;
+    context?: string;
+}
+
+const defaultTableData = {
+    headers: ['Task', 'Status', 'Due Date'],
+    rows: [
+        { cells: ['User Authentication', 'In Progress', '2024-03-25'], status: 'warning' as const },
+        { cells: ['Dashboard UI', 'Completed', '2024-03-20'], status: 'success' as const },
+        { cells: ['API Optimization', 'Pending', '2024-03-22'], status: 'default' as const },
+    ]
+};
+
+export const SimpleTableCard: React.FC<SimpleTableCardProps> = ({
+    title: propTitle,
+    data = {},
+    config = {},
+    style = {},
+    cardId,
+    autoFit,
+    context
+}) => {
+    const titleVal = data.title || propTitle || 'Tasks';
+    const showTitle = config.showTitle !== false;
+    const striped = config.striped !== false;
+    const headers = data.headers || defaultTableData.headers;
+
+    // Normalize rows - handle both [{cells: [...]}] and [[...]] formats
+    const rawRows = data.rows || defaultTableData.rows;
+    const rows = rawRows.map((row: any) => {
+        if (Array.isArray(row)) {
+            return { cells: row, status: 'default' as const };
+        }
+        return row;
+    });
+
+    const content = (
+        <div className="h-full flex flex-col">
+            {showTitle && (
+                <div className="px-4 py-3 border-b border-border">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                        {titleVal}
+                    </h3>
+                </div>
+            )}
+            <div className="flex-1 overflow-auto">
+                <table className="w-full">
+                    <thead>
+                        <tr className="border-b border-border">
+                            {headers.map((header: string, i: number) => (
+                                <th key={i} className="px-4 py-2 text-left text-xs font-medium text-muted-foreground uppercase">
+                                    {header}
+                                </th>
+                            ))}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows.map((row: any, rowIndex: number) => (
+                            <tr
+                                key={rowIndex}
+                                className={cn(
+                                    "border-b border-border/50",
+                                    striped && rowIndex % 2 === 1 && "bg-muted/50"
+                                )}
+                            >
+                                {(row.cells || []).map((cell: string, cellIndex: number) => (
+                                    <td key={cellIndex} className="px-4 py-3 text-sm text-foreground">
+                                        {cellIndex === 1 && row.status ? (
+                                            <Badge
+                                                variant="outline"
+                                                className={cn(
+                                                    "border-0",
+                                                    row.status === 'success' && "bg-green-500/15 text-green-400",
+                                                    row.status === 'warning' && "bg-amber-500/15 text-amber-400",
+                                                    row.status === 'error' && "bg-red-500/15 text-red-400",
+                                                    row.status === 'default' && "bg-gray-500/15 text-muted-foreground"
+                                                )}
+                                            >
+                                                {cell}
+                                            </Badge>
+                                        ) : cell}
+                                    </td>
+                                ))}
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    );
+
+    if (cardId && autoFit) {
+        return <AutoHeightWrapper cardId={cardId} enabled={autoFit}>{content}</AutoHeightWrapper>;
+    }
+    return content;
+};
+
+// ============================================================================
+// LINKS CARD (from blocks.so stats-05)
+// ============================================================================
+
+interface LinkItem {
+    name: string;
+    value: string;
+    href?: string;
+}
+
+interface StatsLinksCardProps {
+    title?: string;
+    data?: {
+        title?: string;
+        description?: string;
+        links?: LinkItem[];
+    };
+    config?: {
+        showTitle?: boolean;
+    };
+    style?: any;
+    cardId?: string;
+    autoFit?: boolean;
+    context?: string;
+}
+
+const defaultLinks: LinkItem[] = [
+    { name: 'Active Projects', value: '12', href: '#' },
+    { name: 'Open Issues', value: '47', href: '#' },
+    { name: 'Pull Requests', value: '8', href: '#' },
+    { name: 'Deployments', value: '156', href: '#' },
+];
+
+export const StatsLinksCard: React.FC<StatsLinksCardProps> = ({
+    title: propTitle,
+    data = {},
+    config = {},
+    style = {},
+    cardId,
+    autoFit,
+    context
+}) => {
+    const titleVal = data.title || propTitle || 'Quick Links';
+    const showTitle = config.showTitle !== false;
+    const links = data.links || defaultLinks;
+
+    const content = (
+        <div className="h-full flex flex-col p-4">
+            {showTitle && (
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-3">
+                    {titleVal}
+                </h3>
+            )}
+            <div className="flex flex-col gap-2 flex-1">
+                {links.map((link, index) => (
+                    <div
+                        key={index}
+                        className="flex items-center justify-between p-3 rounded-lg bg-muted border border-border hover:bg-muted/50 cursor-pointer transition-colors group"
+                    >
+                        <div>
+                            <span className="text-sm font-medium text-foreground">{link.name}</span>
+                            <span className="ml-2 text-xl font-bold text-primary">{link.value}</span>
+                        </div>
+                        <ArrowRight className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+
+    if (cardId && autoFit) {
+        return <AutoHeightWrapper cardId={cardId} enabled={autoFit}>{content}</AutoHeightWrapper>;
+    }
+    return content;
+};
+
+
+// ============================================================================
+// STATS-01 CARD: Horizontal Stats Row (adapted from blocks.so stats-01)
+// ============================================================================
+
+interface Stats01Stat extends StatItem { }
+
+interface Stats01CardProps {
+    title?: string;
+    data?: {
+        title?: string;
+        description?: string;
+        stats?: StatItem[];
+        items?: StatItem[];
+    };
+    config?: {
+        showTitle?: boolean;
+    };
+    style?: any;
+    cardId?: string;
+    autoFit?: boolean;
+    context?: string;
+}
+
+const defaultStats01: StatItem[] = [
+    { name: 'Profit', value: '$287,654', change: '+8.32%', changeType: 'positive' },
+    { name: 'Late payments', value: '$9,435', change: '-12.64%', changeType: 'negative' },
+    { name: 'Pending orders', value: '$173,229', change: '+2.87%', changeType: 'positive' },
+    { name: 'Operating costs', value: '$52,891', change: '-5.73%', changeType: 'negative' },
+];
+
+export const Stats01Card: React.FC<Stats01CardProps> = ({
+    title: propTitle,
+    data = {},
+    config = {},
+    style = {},
+    cardId,
+    autoFit,
+    context
+}) => {
+    const titleVal = data.title || propTitle || 'Financial Overview';
+    const showTitle = config.showTitle !== false;
+    const rawStats = data.stats || data.items || defaultStats01;
+    const stats = rawStats.map(normalizeStat);
+
+    const content = (
+        <div className="h-full flex flex-col">
+            {showTitle && (
+                <div className="px-4 py-3 border-b border-border">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                        {titleVal}
+                    </h3>
+                </div>
+            )}
+            <div className="flex-1 grid grid-cols-2 lg:grid-cols-4 gap-px bg-border/30 rounded-lg overflow-hidden">
+                {stats.map((stat, index) => (
+                    <div key={index} className="p-4 bg-background flex flex-col">
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                            <span className="text-xs font-medium text-muted-foreground">{stat.name}</span>
+                            {stat.change && (
+                                <span className={cn(
+                                    "text-xs font-medium",
+                                    stat.changeType === 'positive' ? "text-green-400" :
+                                        stat.changeType === 'negative' ? "text-red-400" : "text-muted-foreground"
+                                )}>
+                                    {stat.change}
+                                </span>
+                            )}
+                        </div>
+                        {stat.value && <div className="text-2xl font-bold text-foreground mt-auto">{stat.value}</div>}
+                        {stat.description && <div className="text-xs text-muted-foreground mt-1 line-clamp-1">{stat.description}</div>}
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+
+    if (cardId && autoFit) {
+        return <AutoHeightWrapper cardId={cardId} enabled={autoFit}>{content}</AutoHeightWrapper>;
+    }
+    return content;
+};
+
+
+// ============================================================================
+// USAGE STATS CARD: Progress bars for usage (adapted from blocks.so stats-12)
+// ============================================================================
+
+interface UsageItem {
+    name: string;
+    current: string;
+    limit: string;
+    percentage: number;
+}
+
+interface UsageStatsCardProps {
+    title?: string;
+    data?: {
+        title?: string;
+        description?: string;
+        items?: UsageItem[];
+        subtitle?: string;
+    };
+    config?: {
+        showTitle?: boolean;
+    };
+    style?: any;
+    cardId?: string;
+    autoFit?: boolean;
+    context?: string;
+}
+
+const defaultUsageItems: UsageItem[] = [
+    { name: 'API Requests', current: '358K', limit: '1M', percentage: 35.8 },
+    { name: 'Storage', current: '3.07 GB', limit: '10 GB', percentage: 30.7 },
+    { name: 'Bandwidth', current: '4.98 GB', limit: '100 GB', percentage: 5.0 },
+    { name: 'Users', current: '24', limit: '50', percentage: 48 },
+];
+
+export const UsageStatsCard: React.FC<UsageStatsCardProps> = ({
+    title: propTitle,
+    data = {},
+    config = {},
+    style = {},
+    cardId,
+    autoFit,
+    context
+}) => {
+    const titleVal = data.title || propTitle || 'Resource Usage';
+    const showTitle = config.showTitle !== false;
+    const items = data?.items || defaultUsageItems;
+    // Smart Default for Subtitle using Context
+    const subtitle = data?.subtitle || context || 'Last 30 days';
+
+    const content = (
+        <div className="h-full flex flex-col">
+            {showTitle && (
+                <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                        {titleVal}
+                    </h3>
+                    <span className="text-xs text-muted-foreground">{subtitle}</span>
+                </div>
+            )}
+            <div className="flex-1 p-4 space-y-3 overflow-auto">
+                {items.map((item, index) => (
+                    <div key={index} className="space-y-1.5">
+                        <div className="flex items-center justify-between text-sm">
+                            <span className="text-foreground font-medium">{item.name}</span>
+                            <span className="text-xs text-muted-foreground tabular-nums">
+                                {item.current} / {item.limit}
+                            </span>
+                        </div>
+                        <div className="h-2 bg-muted rounded-full overflow-hidden">
+                            <div
+                                className={cn(
+                                    "h-full rounded-full transition-all",
+                                    item.percentage > 80 ? "bg-red-500" :
+                                        item.percentage > 50 ? "bg-amber-500" : "bg-primary"
+                                )}
+                                style={{ width: `${Math.min(100, item.percentage)}%` }}
+                            />
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+
+    if (cardId && autoFit) {
+        return <AutoHeightWrapper cardId={cardId} enabled={autoFit}>{content}</AutoHeightWrapper>;
+    }
+    return content;
+};
+
+
+// ============================================================================
+// STORAGE CARD: Segmented usage bar (adapted from blocks.so stats-13)
+// ============================================================================
+
+interface StorageSegment {
+    label: string;
+    value: number;
+    color: string;
+}
+
+interface StorageCardProps {
+    title?: string;
+    data?: {
+        title?: string;
+        description?: string;
+        used?: number;
+        total?: number;
+        unit?: string;
+        segments?: StorageSegment[];
+    };
+    config?: {
+        showTitle?: boolean;
+    };
+    style?: any;
+    cardId?: string;
+    autoFit?: boolean;
+    context?: string;
+}
+
+const defaultSegments: StorageSegment[] = [
+    { label: 'Documents', value: 2400, color: 'bg-blue-500' },
+    { label: 'Photos', value: 1800, color: 'bg-emerald-500' },
+    { label: 'Videos', value: 3200, color: 'bg-amber-500' },
+    { label: 'Music', value: 900, color: 'bg-purple-500' },
+];
+
+// Default colors for auto-assignment
+const DEFAULT_SEGMENT_COLORS = [
+    'bg-blue-500',
+    'bg-emerald-500',
+    'bg-amber-500',
+    'bg-purple-500',
+    'bg-cyan-500',
+    'bg-pink-500',
+    'bg-indigo-500',
+    'bg-teal-500',
+];
+
+export const StorageCard: React.FC<StorageCardProps> = ({
+    title: propTitle,
+    data = {},
+    config = {},
+    style = {},
+    cardId,
+    autoFit,
+    context
+}) => {
+    const titleVal = data.title || propTitle || 'Storage Usage';
+    const showTitle = config.showTitle !== false;
+    const used = data?.used || 8300;
+    const total = data?.total || 15000;
+    const unit = data?.unit || 'MB';
+
+    // Auto-assign colors if not provided
+    const rawSegments = data?.segments || defaultSegments;
+    const segments = rawSegments.map((seg: any, idx: number) => ({
+        ...seg,
+        color: seg.color || DEFAULT_SEGMENT_COLORS[idx % DEFAULT_SEGMENT_COLORS.length]
+    }));
+
+    const freeValue = total - used;
+
+    const content = (
+        <div className="h-full flex flex-col p-4">
+            {showTitle && (
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-3">
+                    {titleVal}
+                </h3>
+            )}
+
+            <p className="mb-3 text-sm text-muted-foreground">
+                Using <span className="font-semibold text-foreground">{used.toLocaleString()} {unit}</span> of {total.toLocaleString()} {unit}
+            </p>
+
+            <div className="mb-4 flex h-3 w-full overflow-hidden rounded-full bg-muted">
+                {segments.map((segment, index) => (
+                    <div
+                        key={index}
+                        className={cn("h-full", segment.color)}
+                        style={{ width: `${(segment.value / total) * 100}%` }}
+                    />
+                ))}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                {segments.map((segment, index) => (
+                    <div key={index} className="flex items-center gap-2">
+                        <span className={cn("size-2.5 shrink-0 rounded", segment.color)} />
+                        <span className="text-xs text-muted-foreground">{segment.label}</span>
+                        <span className="text-xs tabular-nums text-muted-foreground">{segment.value} {unit}</span>
+                    </div>
+                ))}
+                <div className="flex items-center gap-2">
+                    <span className="size-2.5 shrink-0 rounded bg-muted" />
+                    <span className="text-xs text-muted-foreground">Free</span>
+                    <span className="text-xs tabular-nums text-muted-foreground">{freeValue} {unit}</span>
+                </div>
+            </div>
+        </div>
+    );
+
+    if (cardId && autoFit) {
+        return <AutoHeightWrapper cardId={cardId} enabled={autoFit}>{content}</AutoHeightWrapper>;
+    }
+    return content;
+};
+
+
+// ============================================================================
+// ACCORDION TABLE CARD: Expandable hierarchical table (from blocks.so table-01)
+// ============================================================================
+
+import { useState } from 'react';
+import { ChevronDown, ChevronRight } from 'lucide-react';
+
+interface AccordionRowData {
+    id: string;
+    name: string;
+    category: string;
+    value: number;
+    date: string;
+    children?: AccordionRowData[];
+}
+
+interface AccordionTableCardProps {
+    title?: string;
+    data?: {
+        title?: string;
+        description?: string;
+        rows?: AccordionRowData[];
+    };
+    config?: {
+        showTitle?: boolean;
+    };
+    style?: any;
+    cardId?: string;
+    autoFit?: boolean;
+    context?: string;
+}
+
+const defaultAccordionData: AccordionRowData[] = [
+    {
+        id: '001', name: 'Project Alpha', category: 'Development', value: 45000, date: '2024-01-15',
+        children: [
+            { id: '001-01', name: 'Frontend Module', category: 'Development', value: 15000, date: '2024-01-16' },
+            { id: '001-02', name: 'Backend Module', category: 'Development', value: 20000, date: '2024-01-21' },
+        ]
+    },
+    {
+        id: '002', name: 'Marketing Campaign', category: 'Marketing', value: 28500, date: '2024-01-18',
+        children: [
+            { id: '002-01', name: 'Social Media', category: 'Marketing', value: 12000, date: '2024-01-19' },
+            { id: '002-02', name: 'Email Marketing', category: 'Marketing', value: 8500, date: '2024-01-22' },
+        ]
+    },
+    { id: '003', name: 'Customer Support', category: 'Service', value: 19800, date: '2024-01-25' },
+];
+
+const AccordionRow: React.FC<{ row: AccordionRowData; defaultOpen?: boolean }> = ({ row, defaultOpen = false }) => {
+    const [isOpen, setIsOpen] = useState(defaultOpen);
+    const hasChildren = row.children && row.children.length > 0;
+
+    return (
+        <>
+            <tr className="border-b border-border/50 hover:bg-muted/50">
+                <td className="px-3 py-2 w-8">
+                    <button
+                        onClick={() => setIsOpen(!isOpen)}
+                        className={cn(
+                            "p-1 rounded transition-colors",
+                            hasChildren ? "hover:bg-muted cursor-pointer" : "opacity-30 cursor-default"
+                        )}
+                        disabled={!hasChildren}
+                    >
+                        {hasChildren ? (
+                            isOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />
+                        ) : (
+                            <div className="w-3.5 h-3.5" />
+                        )}
+                    </button>
+                </td>
+                <td className="px-3 py-2 text-xs  text-muted-foreground">{row.id}</td>
+                <td className="px-3 py-2 text-sm font-medium">{row.name}</td>
+                <td className="px-3 py-2 text-xs text-muted-foreground">{row.category}</td>
+                <td className="px-3 py-2 text-sm  font-semibold text-right">${row.value.toLocaleString()}</td>
+                <td className="px-3 py-2 text-xs text-muted-foreground">{row.date}</td>
+            </tr>
+            {hasChildren && isOpen && row.children?.map(child => (
+                <tr key={child.id} className="border-b border-border/50 bg-muted/50">
+                    <td className="px-3 py-2 w-8"></td>
+                    <td className="px-3 py-2 text-xs  text-muted-foreground pl-6">{child.id}</td>
+                    <td className="px-3 py-2 text-xs">{child.name}</td>
+                    <td className="px-3 py-2 text-xs text-muted-foreground">{child.category}</td>
+                    <td className="px-3 py-2 text-xs  text-right">${child.value.toLocaleString()}</td>
+                    <td className="px-3 py-2 text-xs text-muted-foreground">{child.date}</td>
+                </tr>
+            ))}
+        </>
+    );
+};
+
+export const AccordionTableCard: React.FC<AccordionTableCardProps> = ({
+    title: propTitle,
+    data = {},
+    config = {},
+    style = {},
+    cardId,
+    autoFit,
+    context
+}) => {
+    const titleVal = data.title || propTitle || 'Projects';
+    const showTitle = config.showTitle !== false;
+    const rows = data?.rows || defaultAccordionData;
+
+    const content = (
+        <div className="h-full flex flex-col">
+            {showTitle && (
+                <div className="px-4 py-3 border-b border-border">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                        {titleVal}
+                    </h3>
+                </div>
+            )}
+            <div className="flex-1 overflow-auto">
+                <table className="w-full text-sm">
+                    <thead className="bg-muted sticky top-0">
+                        <tr className="border-b border-border">
+                            <th className="px-3 py-2 w-8"></th>
+                            <th className="px-3 py-2 text-left text-xs font-semibold text-muted-foreground">ID</th>
+                            <th className="px-3 py-2 text-left text-xs font-semibold text-muted-foreground">Name</th>
+                            <th className="px-3 py-2 text-left text-xs font-semibold text-muted-foreground">Category</th>
+                            <th className="px-3 py-2 text-right text-xs font-semibold text-muted-foreground">Value</th>
+                            <th className="px-3 py-2 text-left text-xs font-semibold text-muted-foreground">Date</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows.map((row, index) => (
+                            <AccordionRow key={row.id} row={row} defaultOpen={index === 0} />
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    );
+
+    if (cardId && autoFit) {
+        return <AutoHeightWrapper cardId={cardId} enabled={autoFit}>{content}</AutoHeightWrapper>;
+    }
+    return content;
+};
+
+
+// ============================================================================
+// STATS ROW CARD (from stats-01)
+// ============================================================================
+
+interface StatsRowCardProps {
+    title?: string;
+    data?: {
+        stats?: StatItem[];
+        items?: StatItem[];
+    };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const StatsRowCard: React.FC<StatsRowCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    // Use normalizeStat for robustness
+    const rawStats = data.stats || data.items || [];
+    const stats = rawStats.map(normalizeStat);
+
+    return (
+        <div className="h-full p-4 grid grid-cols-4 gap-4">
+            {stats.map((s, i) => (
+                <div key={i} className="text-center">
+                    <div className="text-xs text-muted-foreground">{s.name}</div>
+                    {s.value && <div className="text-lg font-bold text-foreground">{s.value}</div>}
+                    {s.change && (
+                        <div className={`text-xs ${s.changeType === 'positive' ? 'text-green-400' : s.changeType === 'negative' ? 'text-red-400' : 'text-muted-foreground'}`}>
+                            {s.change}
+                        </div>
+                    )}
+                </div>
+            ))}
+        </div>
+    );
+};
+
+
+// ============================================================================
+// PLAN OVERVIEW CARD (from stats-07)
+// ============================================================================
+
+interface PlanOverviewCardProps {
+    title?: string;
+    data?: { plan?: string; items?: Array<{ name: string; current: number; allowed: number; percentage: number }> };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const PlanOverviewCard: React.FC<PlanOverviewCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    const items = data.items || [];
+    const accentColor = style.accentColor || '#F5C542';
+    return (
+        <div className="h-full p-4">
+            <div className="text-sm text-muted-foreground mb-3">
+                You are on the <span className="font-medium text-foreground">{data.plan || 'Starter Plan'}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+                {items.map((p, i) => (
+                    <div key={i} className="flex items-center gap-3">
+                        <svg viewBox="0 0 36 36" className="w-12 h-12">
+                            <circle cx="18" cy="18" r="14" fill="none" stroke="#374151" strokeWidth="4" />
+                            <circle cx="18" cy="18" r="14" fill="none" stroke={accentColor} strokeWidth="4" strokeDasharray={`${(p.percentage || 0) * 0.88} 88`} transform="rotate(-90 18 18)" />
+                        </svg>
+                        <div>
+                            <div className="text-xs font-medium text-foreground">{p.name}</div>
+                            <div className="text-xs text-muted-foreground">{p.current} of {p.allowed} used</div>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+
+// ============================================================================
+// TREND CARDS (from stats-10)
+// ============================================================================
+
+interface TrendCardsCardProps {
+    title?: string;
+    data?: { items?: Array<{ name: string; ticker: string; value: string; change: string; percentChange: string; changeType: 'positive' | 'negative' }> };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const TrendCardsCard: React.FC<TrendCardsCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    const items = data.items || [];
+    return (
+        <div className="h-full p-4 grid grid-cols-3 gap-4">
+            {items.map((t, i) => (
+                <div key={i} className="bg-muted/30 rounded-lg p-3">
+                    <div className="text-xs text-foreground">{t.name} <span className="text-muted-foreground">({t.ticker})</span></div>
+                    <div className={`text-xl font-bold ${t.changeType === 'positive' ? 'text-green-400' : 'text-red-400'}`}>{t.value}</div>
+                    <div className={`text-xs ${t.changeType === 'positive' ? 'text-green-400' : 'text-red-400'}`}>{t.change} ({t.percentChange})</div>
+                </div>
+            ))}
+        </div>
+    );
+};
+
+
+// ============================================================================
+// USAGE GAUGE CARD (from stats-12)
+// ============================================================================
+
+interface UsageGaugeCardProps {
+    title?: string;
+    data?: { items?: Array<{ name: string; current: number; limit: number; unit: string }> };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const UsageGaugeCard: React.FC<UsageGaugeCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    const items = data.items || [];
+    const accentColor = style.accentColor || '#F5C542';
+    return (
+        <div className="h-full p-4 flex flex-col gap-3">
+            {items.map((u, i) => {
+                const percent = Math.round((u.current / u.limit) * 100);
+                return (
+                    <div key={i} className="flex flex-col gap-1">
+                        <div className="flex justify-between text-xs">
+                            <span className="text-muted-foreground">{u.name}</span>
+                            <span className="text-muted-foreground">{u.current}{u.unit} / {u.limit}{u.unit}</span>
+                        </div>
+                        <div className="h-2 bg-charcoal-700 rounded-full overflow-hidden">
+                            <div className="h-full rounded-full" style={{ width: `${percent}%`, backgroundColor: accentColor }} />
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
+    );
+};
+
+
+// ============================================================================
+// STORAGE DONUT CARD (from stats-13)
+// ============================================================================
+
+interface StorageDonutCardProps {
+    title?: string;
+    data?: { used?: number; total?: number; unit?: string; segments?: Array<{ label: string; value: number; color: string }> };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const StorageDonutCard: React.FC<StorageDonutCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    const segments = data.segments || [];
+    const totalUsed = segments.reduce((sum, s) => sum + s.value, 0);
+    return (
+        <div className="h-full p-4 flex flex-col items-center justify-center gap-3">
+            <svg viewBox="0 0 36 36" className="w-24 h-24">
+                <circle cx="18" cy="18" r="14" fill="none" stroke="#374151" strokeWidth="4" />
+                {segments.reduce((acc: any[], seg, idx) => {
+                    const prevOffset = acc.length > 0 ? acc[acc.length - 1].offset : 0;
+                    const percent = (seg.value / (data.total || 15)) * 88;
+                    acc.push({ color: seg.color, percent, offset: prevOffset + percent });
+                    return acc;
+                }, []).map((seg: any, idx: number) => (
+                    <circle key={idx} cx="18" cy="18" r="14" fill="none" stroke={seg.color} strokeWidth="4"
+                        strokeDasharray={`${seg.percent} ${88 - seg.percent}`}
+                        strokeDashoffset={-seg.offset + seg.percent}
+                        transform="rotate(-90 18 18)" />
+                ))}
+            </svg>
+            <div className="text-sm text-muted-foreground">{data.used || totalUsed} / {data.total || 15} {data.unit || 'GB'}</div>
+        </div>
+    );
+};
+
+
+// ============================================================================
+// TASK TABLE CARD (from table-02)
+// ============================================================================
+
+interface TaskTableCardProps {
+    title?: string;
+    data?: { tasks?: Array<{ id: string; title: string; assignee: string; status: string; priority: string; dueDate: string }> };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const TaskTableCard: React.FC<TaskTableCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    const tasks = data.tasks || [];
+    return (
+        <div className="h-full p-4 overflow-auto">
+            <table className="w-full text-sm">
+                <thead>
+                    <tr className="border-b border-border text-left text-muted-foreground">
+                        <th className="pb-2">Task</th><th className="pb-2">Assignee</th><th className="pb-2">Status</th><th className="pb-2">Due</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {tasks.map((t, i) => (
+                        <tr key={i} className="border-b border-border/50">
+                            <td className="py-2 text-foreground">{t.title}</td>
+                            <td className="py-2 text-muted-foreground">{t.assignee}</td>
+                            <td className="py-2"><Badge variant="outline" className={cn("border-0", t.status === 'completed' ? "bg-green-500/15 text-green-400" : t.status === 'in-progress' ? "bg-blue-500/15 text-blue-400" : t.status === 'pending' ? "bg-amber-500/15 text-amber-400" : "bg-red-500/15 text-red-400")}>{t.status}</Badge></td>
+                            <td className="py-2 text-muted-foreground text-xs">{t.dueDate}</td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+        </div>
+    );
+};
+
+
+// ============================================================================
+// INVENTORY TABLE CARD (from table-03)
+// ============================================================================
+
+interface InventoryTableCardProps {
+    title?: string;
+    data?: { products?: Array<{ sku: string; name: string; stock: number; category: string; status: string; price: string }> };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const InventoryTableCard: React.FC<InventoryTableCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    const products = data.products || [];
+    return (
+        <div className="h-full p-4 overflow-auto">
+            <table className="w-full text-sm">
+                <thead>
+                    <tr className="border-b border-border text-left text-muted-foreground">
+                        <th className="pb-2">SKU</th><th className="pb-2">Product</th><th className="pb-2">Stock</th><th className="pb-2">Price</th><th className="pb-2">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {products.map((p, i) => (
+                        <tr key={i} className="border-b border-border/50">
+                            <td className="py-2 font-mono text-xs text-muted-foreground">{p.sku}</td>
+                            <td className="py-2 text-foreground">{p.name}</td>
+                            <td className="py-2 text-muted-foreground">{p.stock}</td>
+                            <td className="py-2 font-mono text-foreground">{p.price}</td>
+                            <td className="py-2"><Badge variant="outline" className={cn("border-0", p.status === 'active' ? "bg-green-500/15 text-green-400" : p.status === 'pending' ? "bg-amber-500/15 text-amber-400" : "bg-gray-500/15 text-gray-400")}>{p.status}</Badge></td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+        </div>
+    );
+};
+
+
+// ============================================================================
+// PROJECT TABLE CARD (from table-05)
+// ============================================================================
+
+interface ProjectTableCardProps {
+    title?: string;
+    data?: { projects?: Array<{ id: string; name: string; date: string; status: string; amount: string }> };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const ProjectTableCard: React.FC<ProjectTableCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    const projects = data.projects || [];
+    const accentColor = style.accentColor || '#F5C542';
+    return (
+        <div className="h-full p-4 overflow-auto">
+            <table className="w-full text-sm">
+                <thead>
+                    <tr className="border-b border-border text-left text-muted-foreground">
+                        <th className="pb-2">Name</th><th className="pb-2">Date</th><th className="pb-2">Status</th><th className="pb-2 text-right">Amount</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {projects.map((p, i) => (
+                        <tr key={i} className="border-b border-border/50">
+                            <td className="py-2 font-medium text-foreground">{p.name}</td>
+                            <td className="py-2 text-muted-foreground text-xs">{p.date}</td>
+                            <td className="py-2"><Badge variant="outline" className={cn("border-0", p.status === 'completed' ? "bg-green-500/15 text-green-400" : p.status === 'processing' ? "bg-blue-500/15 text-blue-400" : p.status === 'pending' ? "bg-amber-500/15 text-amber-400" : "bg-red-500/15 text-red-400")}>{p.status}</Badge></td>
+                            <td className="py-2 font-mono font-semibold text-right" style={{ color: accentColor }}>{p.amount}</td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+        </div>
+    );
+};
+
+
+// ============================================================================
+// AI CHAT CARD (from ai-03) — live webchat via /api/nexus/webchat
+// ============================================================================
+
+const _WEBCHAT_BASE = 'http://localhost:8000';
+const _POLL_MS = 500;
+const _TIMEOUT_MS = 120_000;
+
+interface _ChatMsg { role: 'user' | 'bot'; content: string; }
+
+interface AiChatCardProps {
+    title?: string;
+    data?: { history?: Array<{ role: 'user' | 'assistant'; content: string }>; placeholder?: string };
+    config?: { showTitle?: boolean };
+    style?: any;
+    isInteractive?: boolean;
+    cardId?: string;
+}
+
+export const AiChatCard: React.FC<AiChatCardProps> = ({ title, data = {}, config = {}, style = {}, isInteractive = false, cardId }) => {
+    const accentColor = style.accentColor || '#F5C542';
+    const placeholder = data?.placeholder || 'Ask me anything...';
+
+    const storageKey = cardId ? `webchat_session_id_${cardId}` : 'webchat_session_id';
+    const historyKey = cardId ? `webchat_history_${cardId}` : 'webchat_history';
+
+    const sessionIdRef = React.useRef<string>(
+        (() => {
+            const stored = localStorage.getItem(storageKey);
+            if (stored) return stored;
+            const id = crypto.randomUUID();
+            localStorage.setItem(storageKey, id);
+            return id;
+        })()
+    );
+    const [messages, setMessages] = React.useState<_ChatMsg[]>(() => {
+        try {
+            const stored = localStorage.getItem(historyKey);
+            return stored ? JSON.parse(stored) : [];
+        } catch { return []; }
+    });
+    const [inputVal, setInputVal] = React.useState('');
+    const [loading, setLoading] = React.useState(false);
+    const bottomRef = React.useRef<HTMLDivElement>(null);
+
+    React.useEffect(() => {
+        bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [messages, loading]);
+
+    React.useEffect(() => {
+        localStorage.setItem(historyKey, JSON.stringify(messages));
+    }, [messages, historyKey]);
+
+    const send = async () => {
+        const text = inputVal.trim();
+        if (!text || loading) return;
+        setMessages(prev => [...prev, { role: 'user', content: text }]);
+        setInputVal('');
+        setLoading(true);
+        const sessionId = sessionIdRef.current;
+        try {
+            const postResp = await fetch(`${_WEBCHAT_BASE}/api/nexus/webchat/inbound`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: sessionId, sender_id: sessionId, sender_name: 'WebChat User', text }),
+            });
+            if (!postResp.ok) throw new Error(`POST failed: ${postResp.status}`);
+
+            const deadline = Date.now() + _TIMEOUT_MS;
+            let reply: string | null = null;
+            while (Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, _POLL_MS));
+                try {
+                    const getResp = await fetch(`${_WEBCHAT_BASE}/api/nexus/webchat/messages/${sessionId}`);
+                    if (getResp.ok) {
+                        const d = await getResp.json();
+                        const msgs: { text: string }[] = d.messages ?? [];
+                        if (msgs.length > 0) { reply = msgs.map(m => m.text).join('\n\n'); break; }
+                    }
+                } catch { /* keep polling */ }
+            }
+            setMessages(prev => [...prev, { role: 'bot', content: reply ?? 'No response — check that the backend is running.' }]);
+        } catch (err) {
+            setMessages(prev => [...prev, { role: 'bot', content: `Error: ${String(err)}` }]);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="h-full p-4 flex flex-col gap-2">
+            {/* message history */}
+            <div className="flex-1 flex flex-col gap-2 overflow-y-auto min-h-0">
+                {messages.length === 0 && !loading && (
+                    <div className="flex-1 flex items-center justify-center text-xs text-muted-foreground">
+                        Send a message to start chatting with the agent
+                    </div>
+                )}
+                {messages.map((msg, i) => (
+                    <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                        <div className={`max-w-[80%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap ${
+                            msg.role === 'user'
+                                ? 'bg-primary/20 text-primary'
+                                : 'bg-muted text-foreground'
+                        }`}>
+                            {msg.content}
+                        </div>
+                    </div>
+                ))}
+                {loading && (
+                    <div className="flex justify-start">
+                        <div className="bg-muted text-muted-foreground rounded-lg px-3 py-2 text-xs animate-pulse">
+                            Thinking…
+                        </div>
+                    </div>
+                )}
+                <div ref={bottomRef} />
+            </div>
+            {/* input */}
+            <div className="flex gap-2 shrink-0">
+                <input
+                    className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                    placeholder={placeholder}
+                    value={inputVal}
+                    onChange={e => setInputVal(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
+                    disabled={loading}
+                />
+                <button
+                    className="px-4 py-2 rounded font-medium text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                    style={{ backgroundColor: accentColor, color: '#000' }}
+                    onClick={send}
+                    disabled={!inputVal.trim() || loading}
+                >
+                    {loading ? '…' : 'Send'}
+                </button>
+            </div>
+        </div>
+    );
+};
+
+
+// ============================================================================
+// SHARE DIALOG CARD (from dialog-09)
+// ============================================================================
+
+interface ShareDialogCardProps {
+    title?: string;
+    data?: { title?: string; shareUrl?: string; message?: string };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const ShareDialogCard: React.FC<ShareDialogCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    const accentColor = style.accentColor || '#F5C542';
+    return (
+        <div className="h-full p-6 flex flex-col gap-4">
+            <div className="text-lg font-medium text-foreground">{data.title || 'Share & Collaborate'}</div>
+            <div className="text-sm text-muted-foreground">{data.message || 'Share with your team'}</div>
+            <div className="flex items-center gap-2">
+                <input className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm" value={data.shareUrl || ''} readOnly />
+                <button className="px-3 py-2 rounded font-medium text-sm" style={{ backgroundColor: accentColor, color: '#000' }}>Copy</button>
+            </div>
+        </div>
+    );
+};
+
+
+// ============================================================================
+// FILE UPLOAD CARD (from file-upload-05)
+// ============================================================================
+
+interface FileUploadCardProps {
+    title?: string;
+    data?: { title?: string; message?: string; maxSize?: number; maxSizeUnit?: string; acceptedTypes?: string[] };
+    config?: { showTitle?: boolean };
+    style?: any;
+}
+
+export const FileUploadCard: React.FC<FileUploadCardProps> = ({ title, data = {}, config = {}, style = {} }) => {
+    return (
+        <div className="h-full p-6 flex flex-col gap-4">
+            <div className="text-lg font-medium text-foreground">{data.title || 'File Upload'}</div>
+            <div className="flex-1 border-2 border-dashed border-border rounded-lg flex flex-col items-center justify-center gap-2">
+                <span className="text-2xl">📁</span>
+                <span className="text-sm text-muted-foreground">{data.message || 'Drag and drop or choose file'}</span>
+                <span className="text-xs text-muted-foreground/50">Max {data.maxSize || 10} {data.maxSizeUnit || 'MB'} • {(data.acceptedTypes || []).join(', ').toUpperCase()}</span>
+            </div>
+        </div>
+    );
+};
+
+
+// ============================================================================
+// FORM LAYOUT CARD (from form-layout-03)
+// ============================================================================
+
+interface FormLayoutCardProps {
+    title?: string;
+    data?: { title?: string; fields?: Array<{ name: string; label: string; type: string; placeholder?: string; required?: boolean }>; submitLabel?: string };
+    config?: { showTitle?: boolean };
+    style?: any;
+    isInteractive?: boolean;
+}
+
+export const FormLayoutCard: React.FC<FormLayoutCardProps> = ({ title, data = {}, config = {}, style = {}, isInteractive = false }) => {
+    const fields = data.fields || [];
+    const accentColor = style.accentColor || '#F5C542';
+    return (
+        <div className="h-full p-6 flex flex-col gap-4">
+            <div className="text-lg font-medium text-foreground">{data.title || 'Form'}</div>
+            {fields.map((f, i) => (
+                <div key={i} className="flex flex-col gap-1">
+                    <label className="text-xs text-muted-foreground">{f.label} {f.required && <span className="text-red-400">*</span>}</label>
+                    {f.type === 'textarea' ? (
+                        <textarea className="px-3 py-2 bg-muted border border-border rounded text-sm" placeholder={f.placeholder} disabled={!isInteractive} rows={3} />
+                    ) : (
+                        <input className="px-3 py-2 bg-muted border border-border rounded text-sm" type={f.type} placeholder={f.placeholder} disabled={!isInteractive} />
+                    )}
+                </div>
+            ))}
+            <button className="px-4 py-2 rounded font-medium text-sm mt-2" style={{ backgroundColor: accentColor, color: '#000' }}>
+                {data.submitLabel || 'Submit'}
+            </button>
+        </div>
+    );
+};

@@ -1,0 +1,1638 @@
+import React from 'react';
+import { createPortal } from 'react-dom';
+import { Code2, Terminal, Globe, FileCode, CheckCircle2, Eye, Clock, Brain, Maximize2, Minimize2, Play, Save, X, Loader2, AlertTriangle, RefreshCw, LayoutGrid, Edit3, ChevronDown, FastForward, Layers } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { useAppStore } from '@/store';
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import Editor from "@monaco-editor/react";
+import ReactMarkdown from 'react-markdown';
+import DOMPurify from 'dompurify';
+import { API_BASE } from '@/lib/api';
+import axios from 'axios';
+import { Button } from '@/components/ui/button';
+
+// Helper component for tabs (assuming it's a simple button for now)
+const PanelTab: React.FC<{ label: string; active: boolean; onClick: () => void; icon: React.ReactNode }> = ({ label, active, onClick, icon }) => (
+    <button
+        onClick={onClick}
+        className={cn(
+            "flex-1 flex items-center justify-center gap-2 py-3 text-xs font-bold uppercase tracking-tight transition-all relative border-b border-border/50",
+            active ? "text-primary bg-primary/5" : "text-muted-foreground hover:text-foreground"
+        )}
+    >
+        {icon}
+        {label}
+        {active && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />}
+    </button>
+);
+
+// Sub-component for User Input to avoid Hook errors in conditional rendering
+const ClarificationInput: React.FC<{ nodeId: string; runId: string; onSubmitted: () => void }> = ({ nodeId, runId, onSubmitted }) => {
+    const [input, setInput] = React.useState('');
+    const [isSubmitting, setIsSubmitting] = React.useState(false);
+
+    const handleSubmit = async () => {
+        if (!input.trim()) return;
+        setIsSubmitting(true);
+        try {
+            await axios.post(`${API_BASE}/runs/${runId}/input`, { // Changed API_BASE_URL to API_BASE
+                node_id: nodeId,
+                response: input
+            });
+            setInput('');
+            onSubmitted();
+        } catch (error) {
+            console.error('Clarification error:', error);
+            alert("Failed to submit input: " + error); // Added alert for user feedback
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
+    return (
+        <div className="flex flex-col gap-2 p-3 bg-muted/50 rounded-lg border border-border">
+            <div className="text-xs font-bold uppercase tracking-wide text-blue-600 dark:text-blue-400 flex items-center gap-1.5">
+                <Brain className="w-3 h-3" /> Clarification Required
+            </div>
+            <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && !isSubmitting && handleSubmit()} // Added onKeyDown for Enter key submission
+                placeholder="Agent needs more input..."
+                className="w-full min-h-[60px] p-2 text-xs bg-white dark:bg-muted border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500/50 resize-none text-foreground"
+                disabled={isSubmitting}
+            />
+            <Button
+                size="sm"
+                onClick={handleSubmit}
+                disabled={isSubmitting || !input.trim()} // Disabled if input is empty
+                className="h-8 text-xs font-bold uppercase tracking-wider bg-blue-600 hover:bg-blue-700 text-white"
+            >
+                {isSubmitting ? "Submitting..." : "Send Response"}
+            </Button>
+        </div>
+    );
+};
+
+import { DocumentAssistant } from '../rag/DocumentAssistant';
+
+export const WorkspacePanel: React.FC = () => {
+    const {
+        codeContent, webUrl, logs, selectedNodeId, nodes, sidebarTab,
+        flowData, selectedExplorerNodeId, currentRun,
+        testMode, runAgentTest, saveTestResult, discardTestResult,
+        generateAppFromReport
+    } = useAppStore();
+    const [activeTab, setActiveTab] = React.useState<'overview' | 'code' | 'web' | 'preview' | 'output' | 'compare'>('overview');
+    const [expandedUrl, setExpandedUrl] = React.useState<string | null>(null);
+    const [activeIframeUrl, setActiveIframeUrl] = React.useState<string | null>(null);
+    const [isZenMode, setIsZenMode] = React.useState(false);
+    const [editedInput, setEditedInput] = React.useState('');
+    const [isEditingInput, setIsEditingInput] = React.useState(false);
+
+    const isExplorer = sidebarTab === 'explorer';
+    const selectedNode = isExplorer
+        ? flowData?.nodes.find((n: any) => n.id === selectedExplorerNodeId)
+        : nodes.find(n => n.id === selectedNodeId);
+
+    const isPlanner = selectedNode?.data?.type === 'PlannerAgent' || selectedNode?.data?.label === 'PlannerAgent';
+
+    // Auto-switch tabs based on node type/content when selection changes
+    React.useEffect(() => {
+        if (!selectedNode) return;
+
+        // Reset edit state
+        setIsEditingInput(false);
+        if (isPlanner && currentRun) {
+            setEditedInput(currentRun.name || '');
+        } else {
+            setEditedInput(selectedNode.data.prompt || '');
+        }
+
+        // Reset web tab state when switching nodes
+        setExpandedUrl(null);
+        setActiveIframeUrl(null);
+
+        // Always default to overview — user can switch manually
+        setActiveTab('overview');
+    }, [selectedNodeId, selectedNode?.data.type, selectedNode?.data.label, isPlanner, currentRun?.name, currentRun?.id]);
+
+    // Auto-switch to Compare tab when test mode activates with results
+    React.useEffect(() => {
+        // console.log('TestMode Effect:', { active: testMode.active, loading: testMode.isLoading, hasOutput: !!testMode.testOutput, nodeId: testMode.nodeId, selected: selectedNode?.id });
+        if (testMode.active && testMode.nodeId === selectedNode?.id && !testMode.isLoading && (testMode.testOutput || testMode.error)) {
+            setActiveTab('compare');
+        }
+        // If test mode is deactivated, switch back to overview
+        if (!testMode.active && activeTab === 'compare') {
+            setActiveTab('overview');
+        }
+    }, [testMode.active, testMode.isLoading, testMode.testOutput, testMode.error, testMode.executionResult, testMode.nodeId, selectedNode?.id, activeTab]);
+
+    const [showSaveConfirm, setShowSaveConfirm] = React.useState(false);
+
+    const handleSaveAndRun = async (runRemaining: boolean) => {
+        setShowSaveConfirm(false);
+        if (currentRun?.id && selectedNode?.id) {
+            await saveTestResult(currentRun.id, selectedNode.id);
+            if (runRemaining) {
+                // Add slight delay to allow save to propagate if needed (though store handles it)
+                setTimeout(() => {
+                    useAppStore.getState().executeNode(currentRun.id, selectedNode.id, 'remaining');
+                }, 100);
+            }
+        }
+    };
+
+    const handleRerunFormatter = () => {
+        if (currentRun?.id && selectedNode?.id) {
+            runAgentTest(currentRun.id, selectedNode.id);
+        }
+    };
+
+    const handleClarificationSubmitted = () => {
+        // Optionally refresh node status or logs after clarification
+        // For now, just let the backend update the run status
+    };
+
+    if (sidebarTab === 'rag') {
+        return <DocumentAssistant />;
+    }
+
+    const effectiveSelectedNodeId = isExplorer ? selectedExplorerNodeId : selectedNodeId;
+
+    if (!effectiveSelectedNodeId) {
+        return (
+            <div className="h-full flex flex-col items-center justify-center p-8 text-center space-y-4">
+                <div className="p-4 rounded-full bg-slate-100 dark:bg-accent">
+                    <Terminal className="w-8 h-8 text-muted-foreground opacity-20" />
+                </div>
+                <div className="space-y-1">
+                    <h3 className="font-bold text-foreground">Agent Inspector</h3>
+                    <p className="text-xs text-muted-foreground max-w-[200px]">Select a node in the graph to view its runtime details, code, and output.</p>
+                </div>
+            </div>
+        );
+    }
+
+    const panelContent = (
+        <div className={cn(
+            "h-full flex flex-col transition-all duration-300 relative",
+            isZenMode ? "fixed inset-0 z-[9999] w-screen h-screen bg-card border border-border" : ""
+        )}>
+            {/* Save Confirmation Modal */}
+            {showSaveConfirm && (
+                <div className="absolute inset-x-0 top-16 z-[50] flex justify-center px-4">
+                    <div className="bg-popover border border-border rounded-lg shadow-sm p-4 max-w-sm w-full space-y-4 animate-in fade-in zoom-in-95 duration-200">
+                        <div className="space-y-1">
+                            <h3 className="font-bold text-sm text-foreground">Save & Continue?</h3>
+                            <p className="text-xs text-muted-foreground">
+                                Saving will update the session. Do you want to run the remaining nodes immediately?
+                            </p>
+                        </div>
+                        <div className="flex flex-col gap-2">
+                            <Button onClick={() => handleSaveAndRun(true)} size="sm" className="w-full justify-start gap-2 bg-primary text-primary-foreground hover:bg-primary/90">
+                                <FastForward className="w-3.5 h-3.5" /> Save & Run Remaining
+                            </Button>
+                            <Button onClick={() => handleSaveAndRun(false)} size="sm" variant="secondary" className="w-full justify-start gap-2">
+                                <Save className="w-3.5 h-3.5" /> Save Only
+                            </Button>
+                            <Button onClick={() => setShowSaveConfirm(false)} size="sm" variant="ghost" className="w-full text-muted-foreground hover:text-foreground">
+                                Cancel
+                            </Button>
+                        </div>
+                    </div>
+                    {/* Backdrop */}
+                    <div className="fixed inset-0 bg-black/20 z-[-1] backdrop-blur-[1px]" onClick={() => setShowSaveConfirm(false)} />
+                </div>
+            )}
+            {/* Sticky Header - Hidden in Zen Mode */}
+            {!isZenMode && (
+                <div className="p-4 border-b border-border glass backdrop-blur z-10 flex flex-col gap-2">
+                    <div className="flex items-center gap-2">
+                        <div className={cn(
+                            "w-2 h-2 rounded-full",
+                            selectedNode?.data.status === 'completed' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]" :
+                                selectedNode?.data.status === 'failed' ? "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]" :
+                                    "bg-blue-500 animate-pulse shadow-[0_0_8px_rgba(59,130,246,0.4)]"
+                        )} />
+                        <div className="flex flex-col">
+                            <span className="text-xs font-bold uppercase tracking-[0.2em] text-foreground leading-none">
+                                {selectedNode?.data.label || "Agent Instance"}
+                            </span>
+                            <span className="text-2xs text-muted-foreground font-medium uppercase tracking-wide mt-1 opacity-70">
+                                {isExplorer ? "Architecture Template" : (selectedNode?.data.status || "Idle")}
+                            </span>
+                        </div>
+                        <span className="ml-auto text-xs text-muted-foreground font-mono">
+                            {selectedNode?.id}
+                        </span>
+
+                        {/* Build App Icon - Next to Agent Title */}
+                        {!isExplorer && currentRun?.id && selectedNode?.id && (
+                            <button
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    const { isGeneratingApp, generateAppFromReport } = useAppStore.getState();
+                                    if (isGeneratingApp) return;
+                                    generateAppFromReport(currentRun.id, selectedNode.id);
+                                }}
+                                disabled={useAppStore.getState().isGeneratingApp}
+                                className={cn(
+                                    "p-1.5 rounded-md transition-all",
+                                    useAppStore.getState().isGeneratingApp
+                                        ? "bg-muted text-muted-foreground cursor-not-allowed"
+                                        : "hover:bg-primary/10 text-muted-foreground hover:text-primary"
+                                )}
+                                title="Build App from this Node"
+                            >
+                                {useAppStore.getState().isGeneratingApp ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                    <LayoutGrid className="w-3.5 h-3.5" />
+                                )}
+                            </button>
+                        )}
+
+                        {/* RUN / RUN AGAIN Button - For idle/completed/failed/stale nodes */}
+                        {selectedNode?.data.status && ['idle', 'completed', 'failed', 'stale'].includes(selectedNode.data.status) && currentRun?.id && !isExplorer && (
+                            <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                    <button
+                                        disabled={testMode.isLoading}
+                                        className={cn(
+                                            "flex items-center ml-2 gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all",
+                                            testMode.isLoading
+                                                ? "bg-muted text-muted-foreground cursor-wait"
+                                                : selectedNode.data.status === 'idle'
+                                                    ? "bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 hover:border-emerald-500/50"
+                                                    : "bg-primary/20 hover:bg-primary/30 text-primary border border-primary/30 hover:border-primary/50"
+                                        )}
+                                        title="Run Options"
+                                    >
+                                        {testMode.isLoading && testMode.nodeId === selectedNode.id ? (
+                                            <>
+                                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                                Running...
+                                            </>
+                                        ) : (
+                                            <>
+                                                <Play className="w-3.5 h-3.5" />
+                                                {selectedNode.data.status === 'idle' ? 'RUN' : 'RUN AGAIN'}
+                                                <ChevronDown className="w-3 h-3 ml-1 opacity-50" />
+                                            </>
+                                        )}
+                                    </button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="w-[200px]">
+                                    <DropdownMenuItem onClick={() => runAgentTest(currentRun.id, selectedNode.id, isEditingInput ? editedInput : undefined)}>
+                                        <Play className="w-3.5 h-3.5 mr-2" />
+                                        Run again (Test Mode)
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem onClick={() => useAppStore.getState().executeNode(currentRun.id, selectedNode.id, 'remaining')}>
+                                        <FastForward className="w-3.5 h-3.5 mr-2" />
+                                        Run Remaining again
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem onClick={() => useAppStore.getState().executeNode(currentRun.id, selectedNode.id, 'all_from_here')}>
+                                        <Layers className="w-3.5 h-3.5 mr-2" />
+                                        Run All again
+                                    </DropdownMenuItem>
+                                </DropdownMenuContent>
+                            </DropdownMenu>
+                        )}
+
+                        {/* Zen Mode Toggle */}
+                        <button
+                            onClick={() => setIsZenMode(!isZenMode)}
+                            className="p-1.5 hover:bg-muted rounded-md text-muted-foreground hover:text-foreground transition-colors"
+                            title="Enter Zen Mode"
+                        >
+                            <Maximize2 className="w-4 h-4" />
+                        </button>
+
+                        {/* Hide Panel Button */}
+                        <button
+                            onClick={() => useAppStore.getState().clearSelection()}
+                            className="p-1.5 hover:bg-red-500/10 rounded-md text-muted-foreground hover:text-red-500 transition-colors"
+                            title="Hide Panel"
+                        >
+                            <X className="w-4 h-4" />
+                        </button>
+                    </div>
+
+                    {/* Stale Warning Banner */}
+                    {selectedNode.data.status === 'stale' && !testMode.active && (
+                        <div className="flex items-center gap-3 p-2 bg-muted/50 border border-muted-foreground/20 rounded-lg">
+                            <div className="flex items-center gap-2 text-muted-foreground text-xs font-semibold">
+                                <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
+                                Stale Data: Upstream inputs have changed. Run again to update.
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Test Mode Banner */}
+                    {testMode.active && testMode.nodeId === selectedNode?.id && (
+                        <div className="flex items-center gap-3 p-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+                            <div className="flex items-center gap-2 text-yellow-400 text-xs font-bold uppercase tracking-wider">
+                                <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse" />
+                                TEST MODE - Changes Not Saved
+                            </div>
+                            <div className="ml-auto flex items-center gap-2">
+                                <button
+                                    onClick={() => setShowSaveConfirm(true)}
+                                    disabled={!testMode.testOutput}
+                                    className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                >
+                                    <Save className="w-3 h-3" />
+                                    Save to Session
+                                </button>
+                                <button
+                                    onClick={discardTestResult}
+                                    className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/30 transition-colors"
+                                >
+                                    <X className="w-3 h-3" />
+                                    Discard
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Test Mode Error */}
+                    {testMode.error && testMode.nodeId === selectedNode?.id && (
+                        <div className="p-2 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-xs">
+                            ⚠️ {testMode.error}
+                        </div>
+                    )}
+
+                    {/* Truncated Prompt Header */}
+                    <div className="text-xs text-muted-foreground line-clamp-2 font-medium border-l-2 border-primary/20 pl-2">
+                        {selectedNode?.data.prompt || "No prompt available for this agent."}
+                    </div>
+                </div>
+            )}
+
+            {/* Tabs - Hidden in Zen Mode */}
+            {!isZenMode && (
+                <div className="flex items-center border-b border-border px-2">
+                    <PanelTab label="Overview" active={activeTab === 'overview'} onClick={() => setActiveTab('overview')} icon={<Terminal className="w-3 h-3" />} />
+                    <PanelTab
+                        label={selectedNode?.data?.iterations?.some((iter: any) => iter.output?.code_variants) ? "Code" : "Output"}
+                        active={activeTab === 'code'}
+                        onClick={() => setActiveTab('code')}
+                        icon={selectedNode?.data?.iterations?.some((iter: any) => iter.output?.code_variants) ? <Code2 className="w-3 h-3" /> : <Terminal className="w-3 h-3" />}
+                    />
+                    <PanelTab label="Web" active={activeTab === 'web'} onClick={() => setActiveTab('web')} icon={<Globe className="w-3 h-3" />} />
+                    <PanelTab label="Preview" active={activeTab === 'preview'} onClick={() => setActiveTab('preview')} icon={<Eye className="w-3 h-3" />} />
+                    <PanelTab label="Stats" active={activeTab === 'output'} onClick={() => setActiveTab('output')} icon={<Terminal className="w-3 h-3" />} />
+
+                    {/* Compare Tab - Only visible when in test mode */}
+                    {testMode.active && testMode.nodeId === selectedNode?.id && (
+                        <button
+                            onClick={() => setActiveTab('compare')}
+                            className={cn(
+                                "flex items-center gap-2 px-4 py-3 text-xs font-bold border-b-2 transition-all ml-auto",
+                                activeTab === 'compare'
+                                    ? "border-yellow-400 text-yellow-400 bg-yellow-400/10"
+                                    : "border-transparent text-yellow-400/70 hover:text-yellow-400 hover:bg-yellow-400/5 animate-pulse"
+                            )}
+                        >
+                            <Play className="w-3 h-3" />
+                            COMPARE
+                        </button>
+                    )}
+                </div>
+            )}
+
+            {/* Zen Mode Floating Controls */}
+            {isZenMode && (
+                <button
+                    onClick={() => setIsZenMode(false)}
+                    className="absolute top-4 right-4 z-[10000] p-2 bg-background/50 hover:bg-background border border-border rounded-full backdrop-blur-sm shadow-sm transition-all text-muted-foreground hover:text-foreground"
+                    title="Exit Zen Mode"
+                >
+                    <Minimize2 className="w-5 h-5" />
+                </button>
+            )}
+
+            {/* Content Area */}
+            <div className="flex-1 overflow-hidden relative">
+                {activeTab === 'overview' && (
+                    <div className="p-4 space-y-6 overflow-y-auto h-full font-mono text-sm select-text">
+
+                        {/* Section: User Query (Global) */}
+                        {!isExplorer && currentRun && (
+                            <div className="space-y-2">
+                                <div className="flex items-center justify-between pb-2 border-b border-border/50">
+                                    <div className="flex items-center gap-2">
+                                        <Terminal className="w-3 h-3 text-primary" />
+                                        <span className="text-xs font-bold uppercase tracking-wide text-foreground">User Query</span>
+                                    </div>
+                                    {isPlanner && (
+                                        <button
+                                            onClick={() => setIsEditingInput(!isEditingInput)}
+                                            className={cn(
+                                                "p-1 rounded hover:bg-muted transition-colors",
+                                                isEditingInput ? "text-primary bg-primary/10" : "text-muted-foreground"
+                                            )}
+                                            title="Edit Query for Re-run"
+                                        >
+                                            <Edit3 className="w-3 h-3" />
+                                        </button>
+                                    )}
+                                </div>
+                                {isPlanner && isEditingInput ? (
+                                    <textarea
+                                        value={editedInput}
+                                        onChange={(e) => setEditedInput(e.target.value)}
+                                        className="w-full p-3 bg-white dark:bg-muted/50 rounded-lg text-foreground/90 leading-relaxed text-sm border border-primary/50 focus:outline-none focus:ring-1 focus:ring-primary min-h-[80px]"
+                                        placeholder="Edit user query..."
+                                    />
+                                ) : (
+                                    <div className="p-3 bg-slate-50 dark:bg-muted/50 rounded-lg text-foreground/90 leading-relaxed text-sm border border-border/50 select-text font-sans">
+                                        {currentRun.name}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {/* Section: Agent Role (System Prompt) */}
+                        <div className="space-y-2">
+                            <div className="flex items-center justify-between pb-2 border-b border-border/50">
+                                <div className="flex items-center gap-2">
+                                    <Brain className="w-3 h-3 text-primary" />
+                                    <span className="text-xs font-bold uppercase tracking-wide text-foreground">Agent Goal</span>
+                                </div>
+                                {!isPlanner && (
+                                    <button
+                                        onClick={() => setIsEditingInput(!isEditingInput)}
+                                        className={cn(
+                                            "p-1 rounded hover:bg-muted transition-colors",
+                                            isEditingInput ? "text-primary bg-primary/10" : "text-muted-foreground"
+                                        )}
+                                        title="Edit Prompt for Re-run"
+                                    >
+                                        <Edit3 className="w-3 h-3" />
+                                    </button>
+                                )}
+                            </div>
+                            {!isPlanner && isEditingInput ? (
+                                <textarea
+                                    value={editedInput}
+                                    onChange={(e) => setEditedInput(e.target.value)}
+                                    className="w-full p-3 bg-white dark:bg-muted/50 rounded-lg text-foreground/90 leading-relaxed text-[11px] border border-primary/50 focus:outline-none focus:ring-1 focus:ring-primary min-h-[80px]"
+                                    placeholder="Edit agent prompt..."
+                                />
+                            ) : (
+                                <div className="p-3 bg-slate-50 dark:bg-muted/50 rounded-lg text-foreground/90 leading-relaxed text-[11px] border border-border/50 select-text">
+                                    {selectedNode?.data.prompt || "N/A"}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Clarification Input for active runs */}
+                        {selectedNode?.data.status === 'waiting_input' && !isExplorer && currentRun && (
+                            <ClarificationInput
+                                nodeId={selectedNode.id}
+                                runId={currentRun.id}
+                                onSubmitted={handleClarificationSubmitted}
+                            />
+                        )}
+                        {/* Logic Steps (for Explorer) */}
+                        {isExplorer && selectedNode?.data && (
+                            <div className="space-y-6">
+                                {/* Description */}
+                                {selectedNode.data.description && (
+                                    <div className="space-y-2">
+                                        <div className="flex items-center gap-2 pb-2 border-b border-border/50">
+                                            <Brain className="w-3 h-3 text-primary" />
+                                            <span className="text-xs font-bold uppercase tracking-wide text-foreground">Component Mission</span>
+                                        </div>
+                                        <div className="text-sm text-foreground leading-relaxed bg-slate-50 dark:bg-muted/50 p-3 rounded-lg border border-border/50">
+                                            {selectedNode.data.description}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Attributes */}
+                                {selectedNode.data.attributes && selectedNode.data.attributes.length > 0 && (
+                                    <div className="space-y-4">
+                                        <div className="flex items-center gap-2 pb-2 border-b border-border/50">
+                                            <Code2 className="w-3 h-3 text-primary" />
+                                            <span className="text-xs font-bold uppercase tracking-wide text-foreground">Technical Attributes</span>
+                                        </div>
+                                        <div className="flex flex-wrap gap-2">
+                                            {selectedNode.data.attributes.map((attr: string, idx: number) => (
+                                                <span key={idx} className="px-2 py-0.5 bg-primary/5 border border-primary/20 text-primary text-xs rounded font-bold uppercase tracking-tight">
+                                                    {attr}
+                                                </span>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Details */}
+                                {selectedNode.data.details && (
+                                    <div className="space-y-3">
+                                        <div className="flex items-center gap-2 pb-2 border-b border-border/50">
+                                            <Terminal className="w-3 h-3 text-primary" />
+                                            <span className="text-xs font-bold uppercase tracking-wide text-foreground">Implementation Details</span>
+                                        </div>
+                                        <ul className="space-y-2 pl-1 select-text">
+                                            {selectedNode.data.details.map((detail: string, idx: number) => (
+                                                <li key={idx} className="flex gap-2 items-start group">
+                                                    <div className="mt-1.5 h-1 w-1 rounded-full bg-primary opacity-40 group-hover:opacity-100 transition-opacity" />
+                                                    <span className="text-[11px] leading-relaxed text-muted-foreground group-hover:text-foreground transition-colors">
+                                                        {detail}
+                                                    </span>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {/* Section: I/O Context */}
+                        {!isExplorer && (
+                            <div className="grid grid-cols-2 gap-2 select-none">
+                                <div className="space-y-1">
+                                    <div className="text-xs uppercase text-muted-foreground font-bold tracking-wide mb-1 italic opacity-70">Inputs (Reads)</div>
+                                    <div className="flex flex-wrap gap-1">
+                                        {selectedNode?.data.reads?.length ? selectedNode?.data.reads.map((r: string) => (
+                                            <span key={r} className="text-2xs px-1.5 py-0.5 bg-blue-500/5 text-blue-600 dark:text-blue-400 border border-blue-500/20 rounded font-bold uppercase select-text">
+                                                {r}
+                                            </span>
+                                        )) : <span className="text-xs text-muted-foreground italic">None</span>}
+                                    </div>
+                                </div>
+                                <div className="space-y-1">
+                                    <div className="text-xs uppercase text-muted-foreground font-bold tracking-wide mb-1 italic opacity-70">Outputs (Writes)</div>
+                                    <div className="flex flex-wrap gap-1">
+                                        {selectedNode?.data.writes?.length ? selectedNode?.data.writes.map((w: string) => (
+                                            <span key={w} className="text-2xs px-1.5 py-0.5 bg-green-500/5 text-green-600 dark:text-green-400 border border-green-500/20 rounded font-bold uppercase select-text">
+                                                {w}
+                                            </span>
+                                        )) : <span className="text-xs text-muted-foreground italic">None</span>}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Section: Performance */}
+                        {!isExplorer && (
+                            <div className="p-3 bg-slate-50 dark:bg-muted/50 rounded-lg flex items-center justify-between border border-border/50 select-none">
+                                <div className="flex items-center gap-2">
+                                    <Clock className="w-3.5 h-3.5 text-primary" />
+                                    <span className="text-xs uppercase font-bold text-muted-foreground tracking-tight">Duration</span>
+                                    <span className="text-xs text-foreground font-mono font-bold">
+                                        {typeof selectedNode?.data.execution_time === 'number'
+                                            ? `${selectedNode.data.execution_time.toFixed(2)}s`
+                                            : selectedNode?.data.execution_time || "0s"}
+                                    </span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <span className="text-xs uppercase font-bold text-muted-foreground tracking-tight">Cost</span>
+                                    <span className="text-xs text-emerald-600 dark:text-emerald-400 font-mono font-bold">
+                                        ${selectedNode?.data.cost?.toFixed(6) || "0.000000"}
+                                    </span>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Section: Logs/Output Snippet */}
+                        <div className="space-y-2">
+                            <div className="flex items-center gap-2 pb-2 border-b border-border/50">
+                                <Terminal className="w-3 h-3 text-primary" />
+                                <span className="text-xs font-bold uppercase tracking-wide text-foreground">Execution Output</span>
+                            </div>
+                            {logs.map((log, i) => (
+                                <div key={i} className="flex flex-col gap-1 pl-2 border-l border-border select-text">
+                                    <div className="text-xs text-muted-foreground uppercase opacity-70 select-none">
+                                        {log.split(':')[0]}
+                                    </div>
+                                    <div className="text-foreground/80 whitespace-pre-wrap break-words text-xs">
+                                        {log.split(':').slice(1).join(':').trim()}
+                                    </div>
+                                </div>
+                            ))}
+                            {/* Display Raw Result Keys if available */}
+                            {(() => {
+                                try {
+                                    const parsed = JSON.parse(codeContent);
+                                    return (
+                                        <div className="mt-2 space-y-1 select-text">
+                                            {parsed.executed_model && (
+                                                <div className="flex justify-between text-xs py-1 border-b border-border/50 bg-primary/5 px-1 rounded">
+                                                    <span className="text-primary font-bold select-none">model</span>
+                                                    <span className="text-foreground font-bold truncate max-w-[150px]">{parsed.executed_model}</span>
+                                                </div>
+                                            )}
+                                            {Object.entries(parsed).slice(0, 5).map(([k, v]) => {
+                                                if (typeof v === 'object' || String(v).length > 200 || k === 'code_variants' || k === 'executed_model') return null;
+                                                return (
+                                                    <div key={k} className="flex justify-between text-xs py-0.5 border-b border-border/50">
+                                                        <span className="text-muted-foreground select-none">{k}</span>
+                                                        <span className="text-foreground truncate max-w-[150px] font-mono">{String(v)}</span>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    )
+                                } catch { return null; }
+                            })()}
+                        </div>
+
+                        {/* TEST MODE COMPARISON PANEL */}
+                        {testMode.active && testMode.nodeId === selectedNode?.id && (
+                            <div className="space-y-4 mt-4 p-4 border-2 border-yellow-500/30 rounded-xl bg-yellow-500/5">
+                                <div className="text-sm uppercase tracking-wide text-yellow-400 font-bold flex items-center gap-2">
+                                    <Play className="w-4 h-4" />
+                                    Test Result Comparison
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-4">
+                                    {/* Original Output */}
+                                    <div className="space-y-2">
+                                        <div className="text-xs font-semibold text-red-400 uppercase tracking-wider flex items-center gap-1">
+                                            <div className="w-1.5 h-1.5 rounded-full bg-red-400" />
+                                            Original Output
+                                        </div>
+                                        <div className="p-3 bg-red-500/5 border border-red-500/20 rounded-lg max-h-[300px] overflow-y-auto">
+                                            <pre className="text-xs text-foreground/80 whitespace-pre-wrap break-all">
+                                                {JSON.stringify(testMode.originalOutput, null, 2) || "No original output"}
+                                            </pre>
+                                        </div>
+                                    </div>
+
+                                    {/* New Test Output */}
+                                    <div className="space-y-2">
+                                        <div className="text-xs font-semibold text-green-400 uppercase tracking-wider flex items-center gap-1">
+                                            <div className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                                            New Test Output
+                                        </div>
+                                        <div className="p-3 bg-green-500/5 border border-green-500/20 rounded-lg max-h-[300px] overflow-y-auto">
+                                            <pre className="text-xs text-foreground/80 whitespace-pre-wrap break-all">
+                                                {JSON.stringify(testMode.testOutput, null, 2) || "No test output yet"}
+                                            </pre>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Key Changes Summary */}
+                                {testMode.testOutput && testMode.originalOutput && (
+                                    <div className="text-xs text-muted-foreground border-t border-yellow-500/20 pt-3">
+                                        <span className="font-semibold text-yellow-400">Hint:</span> Review the differences above.
+                                        Click "Save to Session" to persist the new output, or "Discard" to keep the original.
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                )}
+                {activeTab === 'code' && (
+                    <div className="h-full overflow-y-auto p-4 space-y-6">
+                        {(() => {
+                            const iterations = selectedNode?.data?.iterations;
+
+                            if (!iterations || !Array.isArray(iterations) || iterations.length === 0) {
+                                // Fallback: Show the codeContent if no iterations
+                                return (
+                                    <div className="space-y-4">
+                                        <div className="text-xs uppercase text-muted-foreground font-bold tracking-wide mb-2">
+                                            No Iterations Available
+                                        </div>
+                                        <Editor
+                                            height="400px"
+                                            defaultLanguage="python"
+                                            theme="vs-dark"
+                                            value={codeContent || '# No code available'}
+                                            options={{
+                                                minimap: { enabled: false },
+                                                fontSize: 12,
+                                                fontFamily: 'JetBrains Mono, Menlo, monospace',
+                                                scrollBeyondLastLine: false,
+                                                padding: { top: 8 },
+                                                wordWrap: 'on',
+                                                readOnly: true
+                                            }}
+                                        />
+                                    </div>
+                                );
+                            }
+
+                            return iterations.map((iter: any, idx: number) => {
+                                const iterNum = iter.iteration || (idx + 1);
+                                const output = iter.output || {};
+                                const isLastIteration = idx === iterations.length - 1;
+
+                                // For the final iteration, execution result might be stored at node level, not iteration level
+                                // This is a backend data structure quirk we need to handle
+                                let executionResult = iter.execution_result;
+                                if (!executionResult && isLastIteration && selectedNode?.data?.output) {
+                                    const nodeOutput = selectedNode.data.output;
+                                    if (nodeOutput.execution_status || nodeOutput.execution_result) {
+                                        executionResult = {
+                                            status: nodeOutput.execution_status,
+                                            result: nodeOutput.execution_result,
+                                            execution_time: nodeOutput.execution_time,
+                                            executed_variant: nodeOutput.executed_variant,
+                                            logs: nodeOutput.execution_logs
+                                        };
+                                    }
+                                }
+
+                                const codeVariants = output.code_variants || {};
+                                const callSelf = output.call_self;
+                                const nextInstruction = output.next_instruction;
+                                const iterationContext = output.iteration_context;
+                                const executedVariant = executionResult?.executed_variant || output.executed_variant;
+
+                                // Get the first code variant to display
+                                const codeKeys = Object.keys(codeVariants);
+                                const primaryCodeKey = executedVariant || codeKeys[0];
+                                const primaryCode = codeVariants[primaryCodeKey] || '';
+
+                                // Get other data keys (filtering out meta keys)
+                                const dataKeys = Object.keys(output).filter(k =>
+                                    !['code_variants', 'call_self', 'next_instruction', 'iteration_context',
+                                        'executed_variant', 'input_tokens', 'output_tokens', 'cost', 'total_tokens'].includes(k)
+                                );
+
+                                return (
+                                    <div key={idx} className="border border-border rounded-lg overflow-hidden bg-muted/30">
+                                        {/* Iteration Header */}
+                                        <div className="px-4 py-3 bg-primary/10 border-b border-border flex items-center justify-between">
+                                            <div className="flex items-center gap-3">
+                                                <span className="text-sm font-bold text-primary uppercase tracking-wider">
+                                                    Iteration {iterNum}
+                                                </span>
+                                                {callSelf !== undefined && (
+                                                    <span className={cn(
+                                                        "px-2 py-0.5 rounded text-xs font-bold uppercase",
+                                                        callSelf
+                                                            ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30"
+                                                            : "bg-green-500/20 text-green-400 border border-green-500/30"
+                                                    )}>
+                                                        {callSelf ? "Continues →" : "Final"}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {executedVariant && (
+                                                <span className="text-xs text-muted-foreground font-mono">
+                                                    Executed: {executedVariant}
+                                                </span>
+                                            )}
+                                        </div>
+
+                                        {/* Code Variants Section */}
+                                        {codeKeys.length > 0 && (
+                                            <div className="p-4 space-y-3">
+                                                <div className="text-xs uppercase text-muted-foreground font-bold tracking-wide flex items-center gap-2">
+                                                    <Code2 className="w-3 h-3" />
+                                                    Code Variants ({codeKeys.length})
+                                                </div>
+
+                                                {codeKeys.map((key) => (
+                                                    <div key={key} className={cn(
+                                                        "rounded-lg overflow-hidden border",
+                                                        key === executedVariant
+                                                            ? "border-primary/50 bg-primary/5"
+                                                            : "border-border/50 bg-background/50"
+                                                    )}>
+                                                        <div className="px-3 py-1.5 bg-muted/50 border-b border-border/50 flex items-center justify-between">
+                                                            <span className={cn(
+                                                                "text-xs font-mono font-bold",
+                                                                key === executedVariant ? "text-primary" : "text-muted-foreground"
+                                                            )}>
+                                                                {key}
+                                                            </span>
+                                                            {key === executedVariant && (
+                                                                <span className="text-2xs bg-primary/20 text-primary px-1.5 py-0.5 rounded">
+                                                                    EXECUTED
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <pre className="p-3 text-xs font-mono text-foreground/90 overflow-x-auto whitespace-pre-wrap leading-relaxed">
+                                                            {codeVariants[key]}
+                                                        </pre>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        {/* Data Output Section (for non-code agents or agents with extra metadata) */}
+                                        {codeKeys.length === 0 && dataKeys.length > 0 && (
+                                            <div className="p-4 space-y-3">
+                                                <div className="text-xs uppercase text-muted-foreground font-bold tracking-wide flex items-center gap-2">
+                                                    <Terminal className="w-3 h-3" />
+                                                    Output Data
+                                                </div>
+                                                {dataKeys.map(key => (
+                                                    <div key={key} className="space-y-2">
+                                                        <div className="text-2xs text-muted-foreground font-mono uppercase font-bold tracking-wider">
+                                                            {key}
+                                                        </div>
+                                                        <div className="rounded-lg overflow-hidden border border-border/20 bg-background/40 p-3 text-xs font-mono text-foreground/90 overflow-x-auto whitespace-pre-wrap leading-relaxed shadow-inner">
+                                                            {typeof output[key] === 'object' ? (
+                                                                <pre className="text-foreground/80">{JSON.stringify(output[key], null, 2)}</pre>
+                                                            ) : (
+                                                                <div className="text-foreground/80">{String(output[key])}</div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        {/* Next Instruction (if call_self is true) */}
+                                        {callSelf && nextInstruction && (
+                                            <div className="px-4 pb-4">
+                                                <div className="text-xs uppercase text-yellow-400/70 font-bold tracking-wide mb-2 flex items-center gap-2">
+                                                    <Brain className="w-3 h-3" />
+                                                    Next Instruction
+                                                </div>
+                                                <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg text-xs text-foreground/90 leading-relaxed">
+                                                    {nextInstruction}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Iteration Context */}
+                                        {iterationContext && (
+                                            <div className="px-4 pb-4">
+                                                <div className="text-xs uppercase text-muted-foreground font-bold tracking-wide mb-2">
+                                                    Context
+                                                </div>
+                                                <div className="flex flex-wrap gap-2">
+                                                    {iterationContext.current_step && (
+                                                        <span className="px-2 py-1 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded text-xs font-medium">
+                                                            Current: {iterationContext.current_step}
+                                                        </span>
+                                                    )}
+                                                    {iterationContext.next_step && (
+                                                        <span className="px-2 py-1 bg-purple-500/10 text-purple-400 border border-purple-500/20 rounded text-xs font-medium">
+                                                            Next: {iterationContext.next_step}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Execution Result */}
+                                        {executionResult && (
+                                            <div className="px-4 pb-4">
+                                                <div className="text-xs uppercase text-muted-foreground font-bold tracking-wide mb-2 flex items-center gap-2">
+                                                    <Terminal className="w-3 h-3" />
+                                                    Execution Result
+                                                </div>
+                                                <div className={cn(
+                                                    "p-3 rounded-lg border text-xs",
+                                                    executionResult.status === 'success'
+                                                        ? "bg-green-500/10 border-green-500/20"
+                                                        : "bg-red-500/10 border-red-500/20"
+                                                )}>
+                                                    {/* Status */}
+                                                    <div className="flex items-center gap-2 mb-2">
+                                                        <span className={cn(
+                                                            "px-2 py-0.5 rounded text-xs font-bold uppercase",
+                                                            executionResult.status === 'success'
+                                                                ? "bg-green-500/20 text-green-400"
+                                                                : "bg-red-500/20 text-red-400"
+                                                        )}>
+                                                            {executionResult.status || 'Unknown'}
+                                                        </span>
+                                                        {executionResult.execution_time && (
+                                                            <span className="text-xs text-muted-foreground">
+                                                                {executionResult.execution_time}
+                                                            </span>
+                                                        )}
+                                                        {executionResult.total_time && (
+                                                            <span className="text-xs text-muted-foreground">
+                                                                ({executionResult.total_time}s)
+                                                            </span>
+                                                        )}
+                                                    </div>
+
+                                                    {/* Result Data */}
+                                                    {executionResult.result && (
+                                                        <div className="mt-2">
+                                                            <div className="text-2xs uppercase text-muted-foreground mb-1">Result:</div>
+                                                            {(() => {
+                                                                const result = executionResult.result;
+                                                                // Check if result contains URLs (for Web tab reference)
+                                                                const hasUrls = Object.values(result).some((v: any) =>
+                                                                    typeof v === 'string' && v.includes('http')
+                                                                );
+
+                                                                if (hasUrls) {
+                                                                    return (
+                                                                        <div className="text-xs text-blue-400 italic">
+                                                                            → URLs extracted. See "Web" tab for details.
+                                                                        </div>
+                                                                    );
+                                                                }
+
+                                                                return (
+                                                                    <pre className="text-xs font-mono text-foreground/80 overflow-x-auto whitespace-pre-wrap max-h-32 overflow-y-auto">
+                                                                        {JSON.stringify(result, null, 2)}
+                                                                    </pre>
+                                                                );
+                                                            })()}
+                                                        </div>
+                                                    )}
+
+                                                    {/* Logs */}
+                                                    {executionResult.logs && (
+                                                        <div className="mt-2">
+                                                            <div className="text-2xs uppercase text-muted-foreground mb-1">Logs:</div>
+                                                            <pre className="text-xs font-mono text-foreground/70 whitespace-pre-wrap">
+                                                                {executionResult.logs || '(empty)'}
+                                                            </pre>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Token Stats */}
+                                        {(output.input_tokens || output.output_tokens || output.cost) && (
+                                            <div className="px-4 pb-3 flex items-center gap-4 text-xs text-muted-foreground">
+                                                {output.input_tokens && (
+                                                    <span>Input: {output.input_tokens} tokens</span>
+                                                )}
+                                                {output.output_tokens && (
+                                                    <span>Output: {output.output_tokens} tokens</span>
+                                                )}
+                                                {output.cost && (
+                                                    <span className="text-green-400">${output.cost.toFixed(6)}</span>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            });
+                        })()}
+                    </div>
+                )}
+
+                {
+                    activeTab === 'output' && (
+                        <div className="p-4 font-mono text-xs space-y-4 overflow-y-auto h-full select-text">
+                            <div className="text-green-400 font-bold border-b border-border pb-2 mb-2 select-none">
+                                # Node Execution Details
+                            </div>
+                            {logs.map((log, i) => (
+                                <div key={i} className="flex flex-col gap-1 border-l-2 border-primary/30 pl-3 py-1 bg-muted/50 rounded-r hover:bg-muted transition-colors">
+                                    <div className="text-xs text-muted-foreground uppercase tracking-wide opacity-70 select-none">
+                                        {log.split(':')[0]}
+                                    </div>
+                                    <div className="text-foreground whitespace-pre-wrap break-words">
+                                        {log.split(':').slice(1).join(':').trim()}
+                                    </div>
+                                </div>
+                            ))}
+                            {/* Display Raw Result Keys if available */}
+                            {(() => {
+                                try {
+                                    const parsed = JSON.parse(codeContent);
+                                    return (
+                                        <div className="mt-4 pt-4 border-t border-border">
+                                            <div className="text-yellow-400 font-bold mb-2 select-none"># Results</div>
+                                            {/* Priority: Show Executed Model first */}
+                                            {parsed.executed_model && (
+                                                <div className="flex justify-between border-b border-border/50 py-1 bg-primary/5 px-1 rounded">
+                                                    <span className="text-primary font-bold select-none">model</span>
+                                                    <span className="text-foreground font-bold">{parsed.executed_model}</span>
+                                                </div>
+                                            )}
+                                            {Object.entries(parsed).map(([k, v]) => {
+                                                if (typeof v === 'object' || String(v).length > 200 || k === 'executed_model') return null; // Skip non-primitive or huge
+                                                return (
+                                                    <div key={k} className="flex justify-between border-b border-border/50 py-1">
+                                                        <span className="text-muted-foreground select-none">{k}</span>
+                                                        <span className="text-foreground font-mono">{String(v)}</span>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    )
+                                } catch { return null; }
+                            })()}
+                        </div>
+                    )
+                }
+
+                {/* COMPARE TAB - Test Mode Comparison View */}
+                {activeTab === 'compare' && testMode.active && testMode.nodeId === selectedNode?.id && (
+                    <div className="h-full overflow-y-auto p-4 space-y-4">
+                        <div className="flex items-center gap-2 text-yellow-400 font-bold text-sm uppercase tracking-wider">
+                            <Play className="w-4 h-4" />
+                            Test Result Comparison
+                            <span className="ml-auto text-xs font-normal text-muted-foreground">
+                                Node: {testMode.nodeId}
+                            </span>
+                        </div>
+
+                        {testMode.isLoading && (
+                            <div className="flex items-center justify-center p-8">
+                                <Loader2 className="w-8 h-8 animate-spin text-yellow-400" />
+                                <span className="ml-3 text-muted-foreground">Running agent test...</span>
+                            </div>
+                        )}
+
+                        {testMode.error && (
+                            <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400">
+                                <div className="font-bold mb-1">⚠️ Test Error</div>
+                                <div className="text-sm">{testMode.error}</div>
+                            </div>
+                        )}
+
+                        {!testMode.isLoading && !testMode.error && (
+                            <div className="grid grid-cols-2 gap-4">
+                                {/* Original Output */}
+                                <div className="space-y-2">
+                                    <div className="text-xs font-bold text-red-400 uppercase tracking-wider flex items-center gap-2 sticky top-0 bg-card py-2">
+                                        <div className="w-2 h-2 rounded-full bg-red-400" />
+                                        Original Output
+                                    </div>
+                                    <div className="p-3 bg-red-500/5 border border-red-500/20 rounded-lg max-h-[500px] overflow-y-auto">
+                                        <pre className="text-[11px] text-foreground/80 whitespace-pre-wrap break-all font-mono">
+                                            {JSON.stringify(testMode.originalOutput, null, 2) || "No original output"}
+                                        </pre>
+                                    </div>
+                                </div>
+
+                                {/* New Test Output */}
+                                <div className="space-y-2">
+                                    <div className="text-xs font-bold text-green-400 uppercase tracking-wider flex items-center gap-2 sticky top-0 bg-card py-2">
+                                        <div className="w-2 h-2 rounded-full bg-green-400" />
+                                        New Test Output
+                                    </div>
+                                    <div className="p-3 bg-green-500/5 border border-green-500/20 rounded-lg max-h-[500px] overflow-y-auto">
+                                        <pre className="text-[11px] text-foreground/80 whitespace-pre-wrap break-all font-mono">
+                                            {JSON.stringify(testMode.testOutput, null, 2) || "No test output yet"}
+                                        </pre>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Action Buttons */}
+                        {testMode.testOutput && (
+                            <div className="flex items-center gap-3 pt-4 border-t border-border mt-4">
+                                <button
+                                    onClick={() => currentRun?.id && saveTestResult(currentRun.id, selectedNode?.id || '')}
+                                    className="flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-lg bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/30 transition-colors"
+                                >
+                                    <Save className="w-4 h-4" />
+                                    Save to Session
+                                </button>
+                                <button
+                                    onClick={discardTestResult}
+                                    className="flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/30 transition-colors"
+                                >
+                                    <X className="w-4 h-4" />
+                                    Discard
+                                </button>
+                                <div className="ml-auto text-xs text-muted-foreground">
+                                    💡 Save to persist changes, or Discard to keep original.
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {
+                    activeTab === 'web' && (
+                        <div className="h-full flex flex-col overflow-hidden select-text">
+                            {(() => {
+                                // Extract URLs from RetrieverAgent output
+                                interface UrlInfo {
+                                    url: string;
+                                    content: string;
+                                    domain: string;
+                                }
+
+                                let urls: UrlInfo[] = [];
+                                let parsed: any = null;
+
+                                try {
+                                    parsed = JSON.parse(codeContent);
+
+                                    // Recursive function to find URLs in any object/array
+                                    const findUrlsRecursive = (obj: any) => {
+                                        if (!obj || typeof obj !== 'object') return;
+
+                                        // If it's an array, check each item
+                                        if (Array.isArray(obj)) {
+                                            for (const item of obj) {
+                                                if (typeof item === 'string' && item.startsWith('http')) {
+                                                    addUrl(item);
+                                                } else if (item && typeof item === 'object') {
+                                                    // Check if it's a {url, content} pair
+                                                    if ('url' in item && typeof item.url === 'string' && item.url.startsWith('http')) {
+                                                        addUrl(item.url, item.content);
+                                                    }
+                                                    findUrlsRecursive(item);
+                                                }
+                                            }
+                                        } else {
+                                            // If it's an object, check each property
+                                            for (const [key, value] of Object.entries(obj)) {
+                                                // Handle arrays of URLs in any property (e.g. found_urls: ["http..."])
+                                                if (Array.isArray(value)) {
+                                                    value.forEach(item => {
+                                                        if (typeof item === 'string' && item.startsWith('http')) {
+                                                            addUrl(item);
+                                                        } else if (item && typeof item === 'object' && (item as any).url && typeof (item as any).url === 'string' && (item as any).url.startsWith('http')) {
+                                                            addUrl((item as any).url, (item as any).content);
+                                                        }
+                                                    });
+                                                }
+
+                                                if (typeof value === 'string' && value.startsWith('http')) {
+                                                    addUrl(value);
+                                                } else {
+                                                    findUrlsRecursive(value);
+                                                }
+                                            }
+                                        }
+                                    };
+
+                                    const addUrl = (url: string, content?: any) => {
+                                        try {
+                                            const domain = new URL(url).hostname;
+                                            const newContent = typeof content === 'string' ? content : (content ? JSON.stringify(content) : 'No content extracted');
+
+                                            const existing = urls.find(u => u.url === url);
+                                            if (existing) {
+                                                // Update if existing is just a placeholder or status line, and we have something new
+                                                // Avoid overwriting full text content with a status log
+                                                const isExistingStatus = existing.content === 'Navigation Log' || existing.content.startsWith('Status:') || existing.content.startsWith('Link:') || existing.content.length < 100;
+                                                if (isExistingStatus && newContent !== existing.content) {
+                                                    existing.content = newContent;
+                                                }
+                                            } else {
+                                                urls.push({
+                                                    url,
+                                                    content: newContent,
+                                                    domain
+                                                });
+                                            }
+                                        } catch { }
+                                    };
+
+                                    findUrlsRecursive(parsed);
+
+                                    // 2. Scan iterations/ReAct logs (where MCP tool results live)
+                                    if (selectedNode?.data?.iterations && Array.isArray(selectedNode.data.iterations)) {
+                                        selectedNode.data.iterations.forEach((iter: any) => {
+                                            if (iter.output) {
+                                                findUrlsRecursive(iter.output);
+
+                                                // Check for tool_result
+                                                if (iter.output.iteration_context && iter.output.iteration_context.tool_result) {
+                                                    const toolResult = iter.output.iteration_context.tool_result;
+                                                    if (typeof toolResult === 'string') {
+                                                        const urlRegex = /https?:\/\/[^\s'"]+/g;
+                                                        const matches = toolResult.match(urlRegex);
+                                                        if (matches) {
+                                                            matches.forEach(url => addUrl(url, toolResult));
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // Check for Saved Execution Results (Code Execution)
+                                            if (iter.execution_result) {
+                                                findUrlsRecursive(iter.execution_result);
+
+                                                // Handle stringified Python lists in result block
+                                                // e.g. "found_urls": "['http://...']"
+                                                const resStr = JSON.stringify(iter.execution_result);
+                                                const urlRegex = /https?:\/\/[^\s'"]+/g;
+                                                const matches = resStr.match(urlRegex);
+                                                if (matches) {
+                                                    matches.forEach(url => {
+                                                        // Clean up trailing chars often caught in stringified python lists like combined quote+bracket
+                                                        const cleanUrl = url.replace(/['"\]]+$/, '');
+                                                        addUrl(cleanUrl, "Execution Result");
+                                                    });
+                                                }
+                                            }
+
+                                            // Check for Saved Tool Results (MCP)
+                                            if (iter.tool_result && typeof iter.tool_result === 'string') {
+                                                const urlRegex = /https?:\/\/[^\s'"]+/g;
+                                                const matches = (iter.tool_result as string).match(urlRegex);
+                                                if (matches) matches.forEach((url: string) => addUrl(url, "Tool Result"));
+                                            }
+                                        });
+                                    }
+
+                                    // 3. Scan execution logs (stdout/stderr captured from Sandbox)
+                                    if (selectedNode?.data?.execution_logs) {
+                                        let logs = selectedNode.data.execution_logs;
+                                        // Try to unescape if it looks like a JSON string or has escaped chars
+                                        try {
+                                            if (logs.startsWith('"') && logs.endsWith('"')) {
+                                                logs = JSON.parse(logs);
+                                            } else {
+                                                logs = logs.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\'/g, "'");
+                                            }
+                                        } catch { }
+
+                                        console.log("Web Tab Scanned Logs:", logs.slice(0, 200) + "...");
+
+                                        // Look for "Link: https://..." or "Navigating to https://..."
+                                        // We want to capture the URL specifically
+                                        // Updated to capture details after the URL (e.g. " | Status: Extracted | Tokens: 50")
+                                        const navigationRegex = /(?:Navigating to|Visiting|Link:) (https?:\/\/[^\s'"]+)(?: \| (.+))?/gi;
+                                        let navMatch;
+                                        while ((navMatch = navigationRegex.exec(logs)) !== null) {
+                                            if (navMatch[1]) {
+                                                const details = navMatch[2] ? navMatch[2].trim() : "Navigation Log";
+                                                addUrl(navMatch[1], details);
+                                            }
+                                        }
+
+                                        // Also generic URL scan
+                                        const urlRegex = /https?:\/\/[^\s'"]+/g;
+                                        const matches = logs.match(urlRegex);
+                                        if (matches) {
+                                            matches.forEach((url: string) => addUrl(url, "Log output"));
+                                        }
+                                    }
+
+                                    // 4. Final fallback: Scan all text content in all iterations/code_variants
+                                    const allContentStr = JSON.stringify({
+                                        parsed: parsed || {},
+                                        iterations: selectedNode?.data?.iterations || []
+                                    });
+                                    const globalUrlMatchList = allContentStr.match(/https?:\/\/[^\s'"]+/g);
+                                    if (globalUrlMatchList) {
+                                        globalUrlMatchList.forEach(url => {
+                                            const cleanUrl = url.replace(/['"\]]+$/, '');
+                                            addUrl(cleanUrl, "Global Scan");
+                                        });
+                                    }
+                                } catch (e) {
+                                    console.log("Web Tab Scan Error:", e);
+                                }
+
+                                // The state hooks are at the component level now
+
+                                if (urls.length === 0) {
+                                    console.log("Web Tab Debug: No URLs found. Parsed:", parsed, "Iterations:", selectedNode?.data?.iterations?.length);
+                                    return (
+                                        <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground gap-4 p-8 overflow-auto">
+                                            <Globe className="w-16 h-16 opacity-20" />
+                                            <div className="text-center mb-4">
+                                                <p className="text-sm font-medium mb-1">List of URLs Found will be populated here</p>
+                                                <p className="text-xs opacity-70">Waiting to visit web pages</p>
+                                            </div>
+
+                                            {/* DEBUG: Dump node data to see what we actually have */}
+                                            <div className="w-full text-left bg-muted p-4 rounded text-xs text-foreground font-mono whitespace-pre overflow-auto max-h-96 border border-border">
+                                                <div className="font-bold text-red-500 mb-2">RAW DATA DUMP</div>
+                                                {JSON.stringify({
+                                                    iterations: selectedNode?.data?.iterations,
+                                                    execution_result: selectedNode?.data?.execution_result,
+                                                    tool_result_scan: parsed
+                                                }, null, 2)}
+                                            </div>
+                                        </div>
+                                    );
+                                }
+
+                                console.log("Web Tab Debug: Found URLs", urls);
+
+                                return (
+                                    <>
+                                        {/* URL List */}
+                                        <div className="flex-1 overflow-y-auto p-3 space-y-2">
+                                            <div className="text-xs uppercase text-muted-foreground font-bold mb-3 flex items-center gap-2">
+                                                <Globe className="w-3 h-3" />
+                                                Web Sources ({urls.length})
+                                            </div>
+
+                                            {urls.map((urlInfo, idx) => (
+                                                <div key={idx} className="border border-border rounded-lg overflow-hidden bg-muted">
+                                                    {/* Accordion Header */}
+                                                    <button
+                                                        onClick={() => setExpandedUrl(expandedUrl === urlInfo.url ? null : urlInfo.url)}
+                                                        className="w-full p-3 flex items-center gap-3 hover:bg-muted/50 transition-colors text-left"
+                                                    >
+                                                        <div className={cn(
+                                                            "w-5 h-5 flex items-center justify-center transition-transform",
+                                                            expandedUrl === urlInfo.url && "rotate-90"
+                                                        )}>
+                                                            <svg className="w-3 h-3 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                                            </svg>
+                                                        </div>
+                                                        <div className="flex-1 min-w-0">
+                                                            <div className="text-xs font-medium text-primary truncate">{urlInfo.domain}</div>
+                                                            <div className="text-xs text-muted-foreground truncate">{urlInfo.url}</div>
+                                                        </div>
+                                                        <button
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                setActiveIframeUrl(urlInfo.url);
+                                                                setExpandedUrl(urlInfo.url);
+                                                            }}
+                                                            className="px-2 py-1 text-xs bg-primary/10 text-primary rounded hover:bg-primary/20 transition-colors"
+                                                        >
+                                                            Open
+                                                        </button>
+                                                    </button>
+
+                                                    {/* Accordion Content */}
+                                                    {expandedUrl === urlInfo.url && (
+                                                        <div className="px-4 pb-4 pt-2 border-t border-border/50">
+
+                                                            {/* Iframe View */}
+                                                            {activeIframeUrl === urlInfo.url ? (
+                                                                <div className="flex flex-col gap-2">
+                                                                    <div className="flex items-center justify-between mb-1">
+                                                                        <span className="text-xs text-muted-foreground font-medium">Web Preview (50% Zoom)</span>
+                                                                        <button
+                                                                            onClick={handleRerunFormatter}
+                                                                            className="p-1 hover:bg-accent rounded text-xs text-blue-400 flex items-center gap-1"
+                                                                            title="Run Again"
+                                                                        >
+                                                                            <RefreshCw size={14} />
+                                                                            <span>RUN AGAIN</span>
+                                                                        </button>
+
+                                                                        {/* Create App Button */}
+                                                                        {selectedNode.data?.status === 'completed' && (
+                                                                            <button
+                                                                                onClick={() => generateAppFromReport(currentRun?.id || "", selectedNode.id)}
+                                                                                className="p-1 hover:bg-accent rounded text-xs text-yellow-400 flex items-center gap-1"
+                                                                                title="Create App from Report"
+                                                                            >
+                                                                                <LayoutGrid size={14} />
+                                                                                <span>CREATE APP</span>
+                                                                            </button>
+                                                                        )}
+                                                                        <button
+                                                                            onClick={(e) => {
+                                                                                e.stopPropagation();
+                                                                                setActiveIframeUrl(null);
+                                                                            }}
+                                                                            className="text-xs text-blue-400 hover:text-blue-300"
+                                                                        >
+                                                                            Switch to Text Limit
+                                                                        </button>
+                                                                    </div>
+                                                                    <div className="w-full h-96 bg-white overflow-hidden rounded relative border border-border">
+                                                                        <div className="absolute inset-0 w-[200%] h-[200%] origin-top-left scale-50">
+                                                                            <iframe
+                                                                                src={urlInfo.url}
+                                                                                className="w-full h-full border-none"
+                                                                                title="Web Preview"
+                                                                                sandbox="allow-scripts allow-same-origin"
+                                                                            />
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            ) : (
+                                                                /* Text Content Preview */
+                                                                <>
+                                                                    <div className="text-xs text-muted-foreground mb-2 font-medium">Content Preview:</div>
+                                                                    <div className="text-xs text-foreground/80 bg-black/20 p-3 rounded max-h-40 overflow-y-auto whitespace-pre-wrap font-mono leading-relaxed">
+                                                                        {urlInfo.content.slice(0, 500)}
+                                                                        {urlInfo.content.length > 500 && '...'}
+                                                                    </div>
+                                                                    <a
+                                                                        href={urlInfo.url}
+                                                                        target="_blank"
+                                                                        rel="noopener noreferrer"
+                                                                        className="mt-2 inline-flex items-center gap-1 text-xs text-blue-400 hover:underline"
+                                                                    >
+                                                                        Open in new tab →
+                                                                    </a>
+                                                                </>
+                                                            )}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            ))}
+                                        </div>
+
+                                    </>
+                                );
+                            })()}
+                        </div>
+                    )
+                }
+
+                {
+                    activeTab === 'preview' && (
+                        <div className="h-full p-6 overflow-auto bg-card">
+                            {(() => {
+                                let formatContent: string | null = null;
+                                let contentType: 'html' | 'markdown' = 'markdown';
+
+                                // Helper to clean escaped content
+                                const cleanContent = (value: string) => {
+                                    return value
+                                        .replace(/\\n/g, '\n')
+                                        .replace(/\\t/g, '\t')
+                                        .replace(/\\'/g, "'")
+                                        .replace(/\\"/g, '"');
+                                };
+
+                                // Helper to check if content is HTML
+                                const isHtml = (value: string) => {
+                                    return value.includes('<div') || value.includes('<h1') ||
+                                        value.includes('<p>') || value.includes('<html') ||
+                                        value.includes('<table') || value.includes('<ul');
+                                };
+
+                                try {
+                                    // PRIORITY: Use live node data directly to ensure auto-refresh
+                                    let parsed: any = selectedNode?.data?.output;
+
+                                    // If no direct output, try codeContent (fallback)
+                                    if (!parsed && codeContent) {
+                                        try {
+                                            parsed = JSON.parse(codeContent);
+                                        } catch {
+                                            // Handle python-style dict strings
+                                            const jsonified = codeContent
+                                                .replace(/'/g, '"')
+                                                .replace(/\bTrue\b/g, 'true')
+                                                .replace(/\bFalse\b/g, 'false')
+                                                .replace(/\bNone\b/g, 'null');
+                                            parsed = JSON.parse(jsonified);
+                                        }
+                                    }
+
+                                    // Ensure parsed is an object
+                                    if (typeof parsed !== 'object' || parsed === null) {
+                                        // If output is a raw string (sometimes happens), treat it as content
+                                        if (typeof parsed === 'string' && parsed.trim().length > 0) {
+                                            // CRITICAL FIX: Try to parse as JSON *before* checking for HTML
+                                            // A JSON string might contain HTML tags in its values, but we want the object, not the raw string.
+                                            let isJsonString = false;
+                                            if (parsed.trim().startsWith('{') || parsed.trim().startsWith('[')) {
+                                                try {
+                                                    const p = JSON.parse(parsed);
+                                                    parsed = p; // It was a stringified JSON, continue to object logic
+                                                    isJsonString = true;
+                                                } catch {
+                                                    // Parse failed, treat as string
+                                                }
+                                            }
+
+                                            // Only if it wasn't a valid JSON string do we check for direct HTML content
+                                            if (!isJsonString) {
+                                                if (isHtml(parsed)) {
+                                                    formatContent = parsed;
+                                                    contentType = 'html';
+                                                } else {
+                                                    formatContent = parsed;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Generate Content from Object (if we have one)
+                                    if (!formatContent && parsed && typeof parsed === 'object') {
+                                        // PASS 1: Look for any key containing HTML content (prioritize actual formatted reports)
+                                        for (const [key, value] of Object.entries(parsed)) {
+                                            if (typeof value === 'string' && value.length > 100 && isHtml(value)) {
+                                                formatContent = cleanContent(value);
+                                                contentType = 'html';
+                                                break;
+                                            }
+                                        }
+
+                                        // PASS 2: If no HTML found, look for keys starting with 'formatted_'
+                                        if (!formatContent) {
+                                            const formattedKeys = Object.keys(parsed).filter(k => k.startsWith('formatted_'));
+                                            for (const key of formattedKeys) {
+                                                const value = parsed[key as keyof typeof parsed];
+                                                if (typeof value === 'string' && value.length > 50) {
+                                                    const cleaned = cleanContent(value);
+                                                    formatContent = cleaned;
+                                                    contentType = isHtml(cleaned) ? 'html' : 'markdown';
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        // PASS 3: Fallback to markdown/content keys
+                                        if (!formatContent) {
+                                            const fallbackKeys = ['markdown_report', 'markdown', 'report', 'content', 'result'];
+                                            for (const key of fallbackKeys) {
+                                                const value = parsed[key as keyof typeof parsed];
+                                                if (typeof value === 'string' && value.trim()) {
+                                                    formatContent = cleanContent(value);
+                                                    contentType = isHtml(formatContent) ? 'html' : 'markdown';
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        // PASS 4: Check the node's "writes" field keys (FormatterAgent uses dynamic key names like "final_comparison_T007")
+                                        if (!formatContent && selectedNode?.data?.writes?.length) {
+                                            for (const writeKey of selectedNode.data.writes) {
+                                                const value = parsed[writeKey as keyof typeof parsed];
+                                                if (typeof value === 'string' && value.trim().length > 50) {
+                                                    formatContent = cleanContent(value);
+                                                    contentType = isHtml(formatContent) ? 'html' : 'markdown';
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        // PASS 5: Last resort — find any long string value (likely the report body)
+                                        if (!formatContent) {
+                                            const metaKeys = new Set(['final_format', 'call_self', 'next_instruction', 'iteration_context', 'ui_config']);
+                                            for (const [key, value] of Object.entries(parsed)) {
+                                                if (typeof value === 'string' && value.length > 200 && !metaKeys.has(key)) {
+                                                    formatContent = cleanContent(value);
+                                                    contentType = isHtml(formatContent) ? 'html' : 'markdown';
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Debug log to help verify updates
+                                    // console.log("Preview Render:", { id: selectedNode?.id, hasOutput: !!selectedNode?.data?.output, formatContent: !!formatContent });
+
+                                } catch (e) {
+                                    // console.error("Preview parsing error:", e);
+                                    // If all parsing fails, try raw content from codeContent as last resort
+                                    if (codeContent && !codeContent.startsWith('{')) {
+                                        formatContent = codeContent.replace(/\\n/g, '\n');
+                                    }
+                                }
+
+                                if (formatContent) {
+                                    // Sanitize HTML for security
+                                    const sanitizedHtml = contentType === 'html'
+                                        ? DOMPurify.sanitize(formatContent)
+                                        : formatContent;
+
+                                    return (
+                                        <div className="preview-content bg-muted p-6 rounded-lg border border-border select-text">
+                                            <style>{`
+                                                .preview-content h1 { font-size: 1.75rem; font-weight: bold; color: hsl(var(--primary)); margin-bottom: 1rem; }
+                                                .preview-content h2 { font-size: 1.5rem; font-weight: bold; color: hsl(var(--primary)); margin-top: 1.5rem; margin-bottom: 0.75rem; border-bottom: 1px solid hsl(var(--border)); padding-bottom: 0.5rem; }
+                                                .preview-content h3 { font-size: 1.25rem; font-weight: bold; color: hsl(var(--foreground)); margin-top: 1rem; margin-bottom: 0.5rem; }
+                                                .preview-content h4 { font-size: 1.1rem; font-weight: 600; color: hsl(var(--muted-foreground)); margin-top: 0.75rem; margin-bottom: 0.5rem; }
+                                                .preview-content p { color: hsl(var(--muted-foreground)); line-height: 1.6; margin-bottom: 0.75rem; }
+                                                .preview-content ul, .preview-content ol { color: hsl(var(--muted-foreground)); padding-left: 1.5rem; margin-bottom: 1rem; }
+                                                .preview-content li { margin-bottom: 0.25rem; }
+                                                .preview-content table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+                                                .preview-content th { background: hsl(var(--muted)); color: hsl(var(--primary)); padding: 0.75rem; text-align: left; border: 1px solid hsl(var(--border)); font-weight: 600; }
+                                                .preview-content td { padding: 0.75rem; border: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); }
+                                                .preview-content tr:nth-child(even) td { background: hsl(var(--background)); }
+                                                .preview-content strong, .preview-content b { color: hsl(var(--primary)); font-weight: 600; }
+                                                .preview-content i, .preview-content em { color: hsl(var(--muted-foreground)); font-style: italic; }
+                                                .preview-content a { color: #60a5fa; text-decoration: underline; }
+                                                .preview-content code { background: hsl(var(--background)); padding: 0.2rem 0.4rem; border-radius: 4px; color: hsl(var(--primary)); border: 1px solid hsl(var(--border)); }
+                                                .preview-content pre { background: hsl(var(--background)); padding: 1rem; border-radius: 8px; overflow-x: auto; border: 1px solid hsl(var(--border)); }
+                                                .preview-content blockquote { border-left: 3px solid hsl(var(--primary)); padding-left: 1rem; color: hsl(var(--muted-foreground)); font-style: italic; }
+                                                .preview-content .report { color: hsl(var(--foreground)); }
+                                            `}</style>
+                                            {contentType === 'html' ? (
+                                                <div dangerouslySetInnerHTML={{ __html: sanitizedHtml }} />
+                                            ) : (
+                                                <ReactMarkdown>{formatContent}</ReactMarkdown>
+                                            )}
+                                        </div>
+                                    );
+                                }
+
+                                return (
+                                    <div className="flex flex-col items-center justify-center h-full text-center text-muted-foreground">
+                                        <FileCode className="w-12 h-12 mb-4 opacity-30" />
+                                        <p className="text-sm">No formatted output available for this node.</p>
+                                        <p className="text-xs mt-2 opacity-70">Select a FormatterAgent or SummarizerAgent to see rendered output.</p>
+                                    </div>
+                                );
+                            })()}
+                        </div>
+                    )
+                }
+            </div >
+        </div >
+    );
+
+    if (isZenMode) {
+        return createPortal(panelContent, document.body);
+    }
+
+    return panelContent;
+};

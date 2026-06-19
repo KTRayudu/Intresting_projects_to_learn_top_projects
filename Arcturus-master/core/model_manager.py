@@ -1,0 +1,363 @@
+import os
+import time
+import asyncio
+import json
+import yaml
+from pathlib import Path
+from google import genai
+from config.gemini_client import get_gemini_client
+from ops.tracing import llm_span
+from opentelemetry.trace import Status, StatusCode
+from google.genai.errors import ServerError
+from dotenv import load_dotenv
+
+from ops.cost import ConfigurableCostCalculator, CostCalculator
+from ops.admin.feature_flags import flag_store
+from ops.cache.semantic_cache import llm_cache
+
+load_dotenv()
+
+ROOT = Path(__file__).parent.parent
+MODELS_JSON = ROOT / "config" / "models.json"
+MODELS_YAML = ROOT / "config" / "models.yaml"
+PROFILE_YAML = ROOT / "config" / "profiles.yaml"
+
+
+def _estimate_tokens(text: str) -> int:
+    """Fallback token estimate: ~4 chars per token."""
+    return max(0, len(text or "") // 4)
+
+
+class ModelManager:
+    def __init__(
+        self,
+        model_name: str = None,
+        provider: str = None,
+        role: str = None,
+        cost_calculator: CostCalculator = None,
+    ):
+        """
+        Initialize ModelManager with flexible model specification.
+
+        Args:
+            model_name: The model to use (key from models.json or raw name).
+            provider: Optional explicit provider ("gemini" or "ollama").
+            role: Optional role ("planner", "verifier") from models.yaml.
+        """
+        self.config = json.loads(MODELS_JSON.read_text())
+        self.profile = yaml.safe_load(PROFILE_YAML.read_text())
+
+        # Load Role Config
+        if MODELS_YAML.exists():
+            self.role_config = yaml.safe_load(MODELS_YAML.read_text())
+        else:
+            self.role_config = {"roles": {}, "settings": {}}
+
+        # Resolve Role if provided
+        if role:
+            if role not in self.role_config.get("roles", {}):
+                raise ValueError(f"Unknown role: '{role}'. Available: {list(self.role_config.get('roles', {}).keys())}")
+
+            # Override model_name with the one defined for the role
+            model_name = self.role_config["roles"][role]
+            # Verify explicit provider setting isn't conflicting?
+            # We assume role config implies the correct provider via the model definition or name.
+
+        # Load settings for Ollama URL
+        try:
+            from config.settings_loader import settings
+            self.ollama_base_url = settings.get("ollama", {}).get("base_url", "http://127.0.0.1:11434")
+        except:
+            self.ollama_base_url = "http://127.0.0.1:11434"
+
+        # 🎯 NEW: Support explicit provider specification (from settings)
+        if provider:
+            self.model_type = provider
+            self.text_model_key = model_name or "gemini-2.5-flash"
+
+            if provider == "gemini":
+                # Gemini: model_name is the actual Gemini model like "gemini-2.5-flash"
+                self.model_info = {
+                    "type": "gemini",
+                    "model": self.text_model_key,
+                    "api_key_env": "GEMINI_API_KEY"
+                }
+                self.client = get_gemini_client()
+            elif provider == "ollama":
+                # Ollama: model_name is the Ollama model like "phi4" or "llama3:8b"
+                self.model_info = {
+                    "type": "ollama",
+                    "model": self.text_model_key,
+                    "url": {
+                        "generate": f"{self.ollama_base_url}/api/generate",
+                        "chat": f"{self.ollama_base_url}/api/chat"
+                    }
+                }
+                self.client = None  # Ollama uses HTTP, no client needed
+            else:
+                raise ValueError(f"Unknown provider: {provider}")
+        else:
+            # 🔄 LEGACY: Lookup in models.json by key
+            if model_name:
+                self.text_model_key = model_name
+            else:
+                self.text_model_key = self.profile["llm"]["text_generation"]
+
+            # Validate that the model exists in config
+            if self.text_model_key not in self.config["models"]:
+                available_models = list(self.config["models"].keys())
+                raise ValueError(f"Model '{self.text_model_key}' not found in models.json. Available: {available_models}")
+
+            self.model_info = self.config["models"][self.text_model_key]
+            self.model_type = self.model_info["type"]
+            self.config_from_file = True # Flag to indicate this came from models.json
+
+            # Initialize client based on model type
+            if self.model_type == "gemini":
+                self.client = get_gemini_client()
+            # Ollama doesn't need a persistent client
+
+        self.cost_calculator = cost_calculator or ConfigurableCostCalculator()
+
+        # 🔒 STRICT MODE ENFORCEMENT
+        if role == "verifier":
+            enforce_local = self.role_config.get("settings", {}).get("enforce_local_verifier", False)
+            if enforce_local and self.model_type != "ollama":
+                raise PermissionError(
+                    f"SECURITY VIOLATION: Role 'verifier' is configured to STRICT LOCAL ONLY. "
+                    f"Attempted to use provider '{self.model_type}'. "
+                    f"Please check config/models.yaml."
+                )
+
+    async def generate_text(self, prompt: str, cache_key: str | None = None) -> str:
+        """
+        Generate text via Gemini or Ollama API.
+        WATCHTOWER: Span for each LLM API call (Gemini, Ollama).
+        - Attributes: model, provider, prompt_length, output_length, cost_usd, input_tokens, output_tokens
+        - cache_key: Optional invariant key for semantic cache when prompt varies by run_id etc.
+        """
+        if flag_store.get("semantic_cache"):
+            cached = llm_cache.get(prompt, self.text_model_key, cache_key)
+            if cached is not None:
+                return cached
+
+        with llm_span(self.text_model_key, self.model_type, len(prompt)) as span:
+            try:
+                if self.model_type == "gemini":
+                    result, input_tokens, output_tokens = await self._gemini_generate(prompt)
+                elif self.model_type == "ollama":
+                    result, input_tokens, output_tokens = await self._ollama_generate(prompt)
+                else:
+                    raise NotImplementedError(f"Unsupported model type: {self.model_type}")
+
+                span.set_attribute("prompt", prompt)
+                span.set_attribute("output_length", len(result))
+                span.set_attribute("output_preview", (result[:1000] if result else ""))
+                span.set_attribute("input_tokens", input_tokens)
+                span.set_attribute("output_tokens", output_tokens)
+                if flag_store.get("cost_tracking"):
+                    cost_result = self.cost_calculator.compute(
+                        input_tokens, output_tokens, self.text_model_key, self.model_type
+                    )
+                    span.set_attribute("cost_usd", cost_result.cost_usd)
+                else:
+                    span.set_attribute("cost_usd", 0)
+
+                if flag_store.get("semantic_cache"):
+                    llm_cache.put(prompt, self.text_model_key, result, cache_key)
+
+                return result
+            except Exception as e:
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                span.record_exception(e)
+                raise
+
+    async def generate_content(self, contents: list) -> str:
+        """
+        Generate content with multimodal input (text + images) via Gemini or Ollama.
+        WATCHTOWER: Span for each LLM API call with multimodal content.
+        - Span name: llm.generate
+        - Attributes: model, provider, prompt_length, output_length, cost_usd, input_tokens, output_tokens
+        """
+        prompt_len = sum(len(c) if isinstance(c, str) else 0 for c in contents)
+        with llm_span(self.text_model_key, self.model_type, prompt_len) as span:
+            try:
+                if self.model_type == "gemini":
+                    await self._wait_for_rate_limit()
+                    result, input_tokens, output_tokens = await self._gemini_generate_content(contents)
+                elif self.model_type == "ollama":
+                    result, input_tokens, output_tokens = await self._ollama_generate_content(contents)
+                else:
+                    raise NotImplementedError(f"Unsupported model type: {self.model_type}")
+                span.set_attribute("output_length", len(result))
+                span.set_attribute("output_preview", (result[:500] if result else ""))
+                span.set_attribute("input_tokens", input_tokens)
+                span.set_attribute("output_tokens", output_tokens)
+                if flag_store.get("cost_tracking"):
+                    cost_result = self.cost_calculator.compute(
+                        input_tokens, output_tokens, self.text_model_key, self.model_type
+                    )
+                    span.set_attribute("cost_usd", cost_result.cost_usd)
+                else:
+                    span.set_attribute("cost_usd", 0)
+                return result
+            except Exception as e:
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                span.record_exception(e)
+                raise
+
+    async def _ollama_generate_content(self, contents: list) -> tuple[str, int, int]:
+        """Generate content with Ollama, supporting multimodal models like gemma3, llava, etc."""
+        import base64
+        import io
+        from PIL import Image as PILImage
+
+        text_parts = []
+        images_base64 = []
+
+        for content in contents:
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif hasattr(content, 'save'):  # PIL Image check
+                # Convert PIL Image to base64
+                try:
+                    img = content
+                    # Convert to RGB if necessary
+                    if img.mode in ('RGBA', 'P'):
+                        img = img.convert('RGB')
+
+                    # Resize if too large (Ollama has limits)
+                    MAX_DIM = 1024
+                    if img.width > MAX_DIM or img.height > MAX_DIM:
+                        img.thumbnail((MAX_DIM, MAX_DIM), PILImage.Resampling.LANCZOS)
+
+                    # Encode to base64
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+                    images_base64.append(encoded)
+                except Exception as e:
+                    print(f"⚠️ Failed to encode image for Ollama: {e}")
+
+        prompt = "\n".join(text_parts)
+
+        if images_base64:
+            return await self._ollama_generate_with_images(prompt, images_base64)
+        return await self._ollama_generate(prompt)
+
+    async def _ollama_generate_with_images(self, prompt: str, images: list) -> tuple[str, int, int]:
+        """Generate with Ollama using images (for multimodal models). Returns (text, input_tokens, output_tokens)."""
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.model_info["url"]["generate"],
+                    json={
+                        "model": self.model_info["model"],
+                        "prompt": prompt,
+                        "images": images,
+                        "stream": False,
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+                    text = result["response"].strip()
+                    inp = result.get("prompt_eval_count")
+                    out = result.get("eval_count")
+                    input_tokens = inp if inp is not None else _estimate_tokens(prompt)
+                    output_tokens = out if out is not None else _estimate_tokens(text)
+                    return (text, input_tokens, output_tokens)
+        except Exception as e:
+            raise RuntimeError(f"Ollama multimodal generation failed: {str(e)}")
+
+    # --- Rate Limiting Helper ---
+    _last_call = 0
+    _lock = asyncio.Lock()
+
+    async def _wait_for_rate_limit(self):
+        """Enforce ~15 RPM limit for Gemini (4s interval)"""
+        await ModelManager._wait_for_rate_limit_static()
+
+    @staticmethod
+    async def _wait_for_rate_limit_static():
+        """Class-level rate limiter usable without a ModelManager instance."""
+        async with ModelManager._lock:
+            now = time.time()
+            elapsed = now - ModelManager._last_call
+            if elapsed < 4.5: # 4.5s buffer for safety
+                sleep_time = 4.5 - elapsed
+                # print(f"[Rate Limit] Sleeping for {sleep_time:.2f}s...")
+                await asyncio.sleep(sleep_time)
+            ModelManager._last_call = time.time()
+
+
+    async def _gemini_generate(self, prompt: str) -> tuple[str, int, int]:
+        """Returns (text, input_tokens, output_tokens)."""
+        await self._wait_for_rate_limit()
+        try:
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=self.model_info["model"],
+                contents=prompt,
+                config=genai.types.GenerateContentConfig(
+                    max_output_tokens=65535,
+                ),
+            )
+            text = response.text.strip()
+            usage = getattr(response, "usage_metadata", None)
+            if usage:
+                inp = getattr(usage, "prompt_token_count", None) or 0
+                out = getattr(usage, "candidates_token_count", None) or 0
+            else:
+                inp = _estimate_tokens(prompt)
+                out = _estimate_tokens(text)
+            return (text, inp, out)
+        except ServerError as e:
+            raise e
+        except Exception as e:
+            raise RuntimeError(f"Gemini generation failed: {str(e)}")
+
+    async def _gemini_generate_content(self, contents: list) -> tuple[str, int, int]:
+        """Returns (text, input_tokens, output_tokens)."""
+        try:
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=self.model_info["model"],
+                contents=contents,
+                config=genai.types.GenerateContentConfig(
+                    max_output_tokens=65535,
+                ),
+            )
+            text = response.text.strip()
+            usage = getattr(response, "usage_metadata", None)
+            if usage:
+                inp = getattr(usage, "prompt_token_count", None) or 0
+                out = getattr(usage, "candidates_token_count", None) or 0
+            else:
+                inp = _estimate_tokens("".join(str(c) for c in contents) if contents else "")
+                out = _estimate_tokens(text)
+            return (text, inp, out)
+        except ServerError as e:
+            raise e
+        except Exception as e:
+            raise RuntimeError(f"Gemini content generation failed: {str(e)}")
+
+    async def _ollama_generate(self, prompt: str) -> tuple[str, int, int]:
+        """Returns (text, input_tokens, output_tokens)."""
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.model_info["url"]["generate"],
+                    json={"model": self.model_info["model"], "prompt": prompt, "stream": False},
+                ) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+                    text = result["response"].strip()
+                    inp = result.get("prompt_eval_count")
+                    out = result.get("eval_count")
+                    input_tokens = inp if inp is not None else _estimate_tokens(prompt)
+                    output_tokens = out if out is not None else _estimate_tokens(text)
+                    return (text, input_tokens, output_tokens)
+        except Exception as e:
+            raise RuntimeError(f"Ollama generation failed: {str(e)}")

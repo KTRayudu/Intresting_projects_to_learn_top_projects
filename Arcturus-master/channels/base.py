@@ -1,0 +1,58 @@
+"""Base channel adapter interface for Arcturus gateway."""
+
+from abc import ABC, abstractmethod
+from typing import Any
+
+
+class ChannelAdapter(ABC):
+    """Abstract base class for channel adapters.
+
+    Each channel (Telegram, WebChat, Slack, etc.) implements this interface
+    to normalize inbound messages and format outbound responses.
+    """
+
+    def __init__(self, channel_name: str, config: dict[str, Any] | None = None):
+        """Initialize the channel adapter.
+
+        Args:
+            channel_name: Identifier for this channel (e.g., "telegram", "webchat")
+            config: Channel-specific configuration dict
+        """
+        self.channel_name = channel_name
+        self.config = config or {}
+
+    @abstractmethod
+    async def send_message(self, recipient_id: str, content: str, **kwargs) -> dict[str, Any]:
+        """Send a message to a recipient on this channel.
+
+        Args:
+            recipient_id: Channel-specific recipient identifier
+            content: Message content (plain text or formatted per channel)
+            **kwargs: Channel-specific options (media, buttons, etc.)
+
+        Returns:
+            Dict with response metadata (message_id, timestamp, etc.)
+        """
+        pass
+
+    async def send_typing_indicator(self, recipient_id: str, **kwargs) -> None:
+        """Send a typing/processing indicator on this channel.
+
+        Default implementation is a no-op.  Channels with native typing API
+        support (Telegram, Discord, Teams, Matrix, WebChat) override this.
+
+        Args:
+            recipient_id: Channel-specific recipient identifier.
+            **kwargs: Channel-specific options.
+        """
+        pass
+
+    @abstractmethod
+    async def initialize(self) -> None:
+        """Initialize the channel adapter (connect, authenticate, etc.)."""
+        pass
+
+    @abstractmethod
+    async def shutdown(self) -> None:
+        """Gracefully shutdown the channel adapter."""
+        pass

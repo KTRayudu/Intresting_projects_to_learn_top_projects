@@ -1,0 +1,109 @@
+import type { SlideTheme } from './SlideFrame';
+import { resolveSlideColors } from './theme-utils';
+import type { Slide } from '../normalizers';
+import { findElement } from '../normalizers';
+import { AnimatedElement } from './elements';
+
+interface Props {
+  slide: Slide;
+  theme: SlideTheme;
+  isThumb?: boolean;
+  imageBaseUrl?: string;
+  availableImageIds?: ReadonlySet<string>;
+}
+
+/** Extract image URL and alt text from the image element content. */
+function parseImageContent(content: unknown): { url: string | null; alt: string } {
+  if (!content) return { url: null, alt: 'Image' };
+  if (typeof content === 'string') {
+    if (content.startsWith('http://') || content.startsWith('https://')) {
+      return { url: content, alt: 'Slide image' };
+    }
+    try {
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed === 'object') {
+        return { url: parsed.url || null, alt: parsed.alt || parsed.description || 'Image' };
+      }
+    } catch { /* not JSON */ }
+    return { url: null, alt: content };
+  }
+  if (typeof content === 'object' && content !== null) {
+    const obj = content as Record<string, unknown>;
+    return { url: (obj.url as string) || null, alt: (obj.alt as string) || (obj.description as string) || 'Image' };
+  }
+  return { url: null, alt: 'Image' };
+}
+
+export function ImageFullSlide({ slide, theme, isThumb, imageBaseUrl, availableImageIds }: Props) {
+  const sc = resolveSlideColors(slide.metadata?.slide_style, theme);
+  const imageEl = findElement(slide, 'image');
+  const bodyEl = findElement(slide, 'body');
+
+  const { url: externalUrl, alt } = parseImageContent(imageEl?.content);
+
+  const generatedReady = !!(imageBaseUrl && availableImageIds?.has(slide.id));
+  const generatedUrl = generatedReady ? `${imageBaseUrl}/${slide.id}` : null;
+  const imageUrl = externalUrl || generatedUrl;
+
+  return (
+    <div
+      className="flex items-center justify-center h-full relative overflow-hidden"
+      style={{
+        backgroundColor: theme.colors.primary + '10',
+        color: theme.colors.text_light,
+      }}
+    >
+      {/* Real image (full bleed) */}
+      {imageUrl ? (
+        <img
+          src={imageUrl}
+          alt={alt}
+          className="absolute inset-0 w-full h-full object-cover"
+          referrerPolicy="no-referrer"
+        />
+      ) : (
+        <div className={`flex flex-col items-center gap-2 ${isThumb ? 'text-[4px]' : 'text-sm'}`}>
+          {!isThumb && (
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke={theme.colors.primary + '50'} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <circle cx="8.5" cy="8.5" r="1.5" />
+              <path d="m21 15-5-5L5 21" />
+            </svg>
+          )}
+          <span className={isThumb ? 'line-clamp-1' : 'italic opacity-60 text-xs text-center px-6'}>
+            {alt}
+          </span>
+        </div>
+      )}
+
+      {/* Title overlay */}
+      {slide.title && (
+        <div
+          className={`absolute bottom-0 left-0 right-0 ${isThumb ? 'p-1' : 'p-6'} z-10`}
+          style={{ background: 'linear-gradient(transparent, rgba(0,0,0,0.7))' }}
+        >
+          <AnimatedElement animation="rise" delay={120} isThumb={isThumb}>
+            <div
+              className={isThumb ? 'text-[5px] font-bold' : 'text-xl font-bold'}
+              style={{
+                color: slide.metadata?.slide_style?.title?.color ? sc.titleColor : '#ffffff',
+                fontFamily: sc.titleFont,
+                ...sc.titleStyle,
+              }}
+            >
+              {slide.title}
+            </div>
+            {bodyEl?.content && (
+              <div
+                className={isThumb ? 'text-[3px] mt-0.5' : 'text-sm mt-2'}
+                style={{ color: sc.bodyColor !== theme.colors.text ? sc.bodyColor : '#dddddd' }}
+              >
+                {bodyEl.content}
+              </div>
+            )}
+          </AnimatedElement>
+        </div>
+      )}
+    </div>
+  );
+}

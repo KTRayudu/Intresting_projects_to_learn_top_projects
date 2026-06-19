@@ -1,0 +1,1129 @@
+# flow.py – 100% NetworkX Graph-First (No agentSession)
+
+import networkx as nx
+import asyncio
+import time
+from memory.context import ExecutionContextManager
+from ops.tracing import (
+    agent_loop_run_span,
+    agent_plan_span,
+    agent_execute_dag_span,
+    agent_execute_node_span,
+    agent_iteration_span,
+    attach_plan_graph_to_span,
+)
+from opentelemetry.trace import Status, StatusCode
+from agents.base_agent import AgentRunner
+from core.utils import log_step, log_error
+from core.event_bus import event_bus
+from core.model_manager import ModelManager
+from ui.visualizer import ExecutionVisualizer
+from rich.live import Live
+from rich.console import Console
+from datetime import datetime
+
+
+# ===== EXPONENTIAL BACKOFF FOR TRANSIENT FAILURES =====
+
+async def retry_with_backoff(
+    async_func,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    retryable_errors: tuple = None,
+    on_retry=None,
+):
+    """
+    Retry an async function with exponential backoff.
+
+    Args:
+        async_func: Async callable to execute
+        max_retries: Maximum retry attempts (default: 3)
+        base_delay: Initial delay in seconds (default: 1.0)
+        retryable_errors: Tuple of exception types to retry on
+        on_retry: Optional callback(attempt: int) called before each retry (1-based)
+
+    Returns:
+        Result of async_func on success
+
+    Raises:
+        Last exception if all retries exhausted
+    """
+    if retryable_errors is None:
+        retryable_errors = (
+            asyncio.TimeoutError,
+            ConnectionError,
+            TimeoutError,
+        )
+
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return await async_func()
+        except retryable_errors as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                if on_retry:
+                    on_retry(attempt + 1)  # 1-based: first retry = 1
+                delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
+                log_step(f"Transient error: {type(e).__name__}. Retrying in {delay}s (attempt {attempt + 1}/{max_retries})", symbol="🔄")
+                await asyncio.sleep(delay)
+            else:
+                log_error(f"All {max_retries} retry attempts failed: {e}")
+        except Exception as e:
+            # Non-retryable error, raise immediately
+            raise
+
+    raise last_exception
+
+
+import re
+
+# ── Voice streaming helper ─────────────────────────────────────────────────
+# Nodes to skip for voice streaming (they produce metadata, not user-facing text)
+_VOICE_SKIP_AGENTS = {
+    "PlannerAgent", "DistillerAgent", "QueryAgent",
+}
+_VOICE_MIN_CHARS = 40  # Don't speak very short outputs
+
+# Patterns for catching technical leakage
+_VOICE_ERROR_KEYWORDS = (
+    r'NameError|TypeError|ValueError|AttributeError|KeyError|IndexError|'
+    r'RuntimeError|ImportError|ModuleNotFoundError|ZeroDivisionError|'
+    r'SyntaxError|IndentationError|UnboundLocalError|RecursionError|'
+    r'AssertionError|OSError|FileNotFoundError|Exception|Traceback'
+)
+_VOICE_ERROR_RE = re.compile(rf'\b({_VOICE_ERROR_KEYWORDS})\b', re.IGNORECASE)
+
+
+def _extract_node_chunk(step_id: str, agent_type: str, output) -> str | None:
+    """
+    Extract a speakable text chunk from a completed node's output.
+
+    Returns a clean string suitable for TTS, or None if the node
+    shouldn't be spoken (e.g., planner, clarification, trivial output).
+    """
+    if agent_type in _VOICE_SKIP_AGENTS:
+        return None
+
+    if not output:
+        return None
+
+    text = None
+
+    # FormatterAgent: prefer the markdown report
+    if isinstance(output, dict):
+        # SKIP IF ERROR PRESENT
+        if output.get("error") or output.get("status") == "failed":
+             return None
+
+        if "Format" in agent_type or agent_type == "FormatterAgent":
+            text = output.get("markdown_report") or output.get("formatted_report")
+            if not text:
+                for k, v in output.items():
+                    if ("report" in k.lower() or "formatted" in k.lower()) and isinstance(v, str):
+                        text = v
+                        break
+
+        # Generic fallback: find the largest string value
+        if not text:
+            best = ""
+            for k, v in output.items():
+                # Skip tech labels
+                if k in ("error", "traceback", "status", "cost"):
+                    continue
+                if isinstance(v, str) and len(v) > len(best):
+                    best = v
+            text = best or None
+
+    elif isinstance(output, str):
+        text = output
+
+    if not text:
+        return None
+
+    # ── Guard: never speak raw Python exception strings ─────────────────────
+    # If the text (especially a short summary) contains technical error words
+    # replace it with None so voice skips this chunk.
+    normalized = text.strip()
+    if (len(normalized) < 400 and _VOICE_ERROR_RE.search(normalized)) or "traceback (most" in normalized.lower():
+        print(f"⚠️ [Voice] Skip chunk: detected technical error in {step_id} output.")
+        return None
+
+    if len(normalized) < _VOICE_MIN_CHARS:
+        return None
+
+    return normalized
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class AgentLoop4:
+    def __init__(self, multi_mcp, strategy="conservative"):
+        self.multi_mcp = multi_mcp
+        self.strategy_name = strategy
+        self.agent_runner = AgentRunner(multi_mcp)
+        self.context = None  # Reference for external stopping
+        self._tasks = set()  # Track active async tasks for immediate cancellation
+        
+        # Load profile for strategy settings
+        from core.profile_loader import get_profile
+        self.profile = get_profile()
+        self.max_steps = self.profile.get("strategy.max_steps", 20)
+
+    def stop(self):
+        """Request execution stop"""
+        if self.context:
+            self.context.stop()
+        # Immediately cancel all tracked tasks
+        for t in list(self._tasks):
+            if not t.done():
+                t.cancel()
+
+    async def _track_task(self, coro_or_future):
+        """Track an async task or future so it can be cancelled immediately on stop()"""
+        if asyncio.iscoroutine(coro_or_future):
+            task = asyncio.create_task(coro_or_future)
+        else:
+            # It's already a task or future (like from asyncio.gather)
+            task = coro_or_future
+            
+        self._tasks.add(task)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._tasks.discard(task)
+
+    async def resume(self, session_path: str):
+        """Resume execution from a saved session file"""
+        from pathlib import Path
+        
+        session_file = Path(session_path)
+        if not session_file.exists():
+            raise FileNotFoundError(f"Session file not found: {session_file}")
+            
+        try:
+            # 1. Load Context
+            self.context = ExecutionContextManager.load_session(session_file)
+            self.context.multi_mcp = self.multi_mcp
+            
+            # 2. Reset Interrupted Nodes
+            # Any node that was 'running' or 'stopped' when last saved should be reset to 'pending'
+            # so it can be re-executed.
+            
+            reset_count = 0
+            for node_id in self.context.plan_graph.nodes:
+                node_data = self.context.plan_graph.nodes[node_id]
+                status = node_data.get("status")
+                
+                if status in ["running", "stopped", "waiting_input"]:
+                    node_data["status"] = "pending"
+                    log_step(f"🔄 Resetting {node_id} from {status} to pending", symbol="Tg")
+                    reset_count += 1
+            
+            if reset_count > 0:
+                self.context._save_session()
+                
+            log_step(f"✅ Resuming session {self.context.plan_graph.graph['session_id']} ({reset_count} steps reset)", symbol="▶️")
+            
+            # 3. Execute DAG (WATCHTOWER)
+            # Always use current trace context (run_span from process_resume). Skip restoring
+            # old trace_id - that fragments the hierarchy (resumed spans end up in a different trace).
+            with agent_execute_dag_span(
+                session_id=self.context.plan_graph.graph.get("session_id", ""),
+                resumed=True,
+            ):
+                return await self._execute_dag(self.context)
+            
+        except Exception as e:
+            log_error(f"Failed to resume session: {e}")
+            raise
+
+    async def run(self, query, file_manifest, globals_schema, uploaded_files, session_id=None, memory_context=None, space_id=None, display_query=None, source="web"):
+        """
+        Main agent loop: bootstrap context with Query node, optionally run file distiller,
+        then planning loop (PlannerAgent) -> merge plan -> execute DAG. Handles replanning when
+        clarification is resolved.
+
+        WATCHTOWER: Span for the full agent loop.
+        - Span name: agent_loop.run
+        - Child spans: agent_loop.plan (planner), agent_loop.execute_dag (DAG execution)
+        """
+        with agent_loop_run_span(session_id or "", query or "") as span:
+            span.set_attribute("session_id", session_id or "")
+            span.set_attribute("title", "Start the Agent Loop")
+            span.set_attribute("query", (query or "")[:100])
+            # 🟢 PHASE 0: BOOTSTRAP CONTEXT (Immediate VS Code feedback)
+            # We create a temporary graph with just a "Query" node (running Planner) so the UI sees meaningful start
+            bootstrap_graph = {
+                "nodes": [
+                {
+                    "id": "Query", 
+                    "description": "Formulate execution plan", 
+                    "agent": "PlannerAgent", 
+                    "status": "running",
+                    "reads": ["original_query"],
+                    "writes": ["plan_graph"]
+                }
+                ],
+                "edges": [
+                    {"source": "ROOT", "target": "Query"}
+                ]
+            }
+
+            try:
+                # Create Context & Save Immediately
+                self.context = ExecutionContextManager(
+                    bootstrap_graph,
+                    session_id=session_id,
+                    original_query=query,
+                    file_manifest=file_manifest,
+                    display_query=display_query,
+                    source=source,
+                )
+                if space_id is not None:
+                    self.context.plan_graph.graph["space_id"] = space_id
+                self.context.memory_context = memory_context  # Store for retrieval
+                # Inject multi_mcp immediately
+                self.context.multi_mcp = self.multi_mcp
+                self.context.plan_graph.graph['globals_schema'].update(globals_schema)
+                self.context._save_session()
+                log_step("✅ Session initialized with Query processing", symbol="🌱")
+            except Exception as e:
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                span.record_exception(e)
+                print(f"❌ ERROR initializing context: {e}")
+                raise
+
+            # Phase 1: File Profiling (if files exist)
+            # Run DistillerAgent to profile uploaded files before planning
+            file_profiles = {}
+            if uploaded_files:
+                # Wrap with retry for transient failures
+                async def run_distiller():
+                    return await self.agent_runner.run_agent(
+                        "DistillerAgent",
+                        {
+                            "task": "profile_files",
+                            "files": uploaded_files,
+                            "instruction": "Profile and summarize each file's structure, columns, content type",
+                            "writes": ["file_profiles"]
+                        }
+                    )
+                file_result = await self._track_task(retry_with_backoff(run_distiller))
+                if file_result["success"]:
+                    file_profiles = file_result["output"]
+                    self.context.set_file_profiles(file_profiles)
+
+            # Phase 2: Planning and Execution Loop
+            try:
+                while True:
+                    if self.context.stop_requested:
+                        break
+
+                    # Note: The "Query" node is already 'running' in our bootstrap context
+
+                    # 🧠 Enable System 2 Reasoning for the Planner
+                    # This ensures the plan is Verified and Refined before execution
+
+                    async def run_planner():
+                        return await self.agent_runner.run_agent(
+                            "PlannerAgent",
+                            {
+                                "original_query": query,
+                                "planning_strategy": self.strategy_name,
+                                "globals_schema": self.context.plan_graph.graph.get("globals_schema", {}),
+                                "file_manifest": file_manifest,
+                                "file_profiles": file_profiles,
+                                "memory_context": memory_context
+                            },
+                            use_system2=True
+                        )
+
+                    # WATCHTOWER: Planner phase span
+                    with agent_plan_span() as plan_span:
+                        def on_plan_retry(attempt):
+                            plan_span.set_attribute("retry_attempt", attempt)
+                            plan_span.set_attribute("is_retry", True)
+
+                        plan_result = await self._track_task(
+                            retry_with_backoff(run_planner, on_retry=on_plan_retry)
+                        )
+                        attach_plan_graph_to_span(plan_span, plan_result)
+
+                    if self.context.stop_requested:
+                        break
+
+                    if not plan_result["success"]:
+                        self.context.mark_failed("Query", plan_result['error'])
+                        raise RuntimeError(f"Planning failed: {plan_result['error']}")
+
+                    if not plan_result.get('output') or 'plan_graph' not in plan_result['output']:
+                        self.context.mark_failed("Query", "Output missing plan_graph")
+                        raise RuntimeError(f"PlannerAgent output missing 'plan_graph' key.")
+
+                    if not isinstance(plan_result['output']['plan_graph'], dict):
+                        # LLM returned null plan_graph (e.g. for simple greetings).
+                        # Synthesise a single FormatterAgent step with a friendly reply.
+                        notes = plan_result["output"].get("ambiguity_notes", [])
+                        reason = notes[0] if notes else "No actionable plan produced."
+                        log_step(f"Planner returned null plan_graph: {reason}", symbol="💬")
+                        plan_result["output"]["plan_graph"] = {
+                            "nodes": [{
+                                "id": "T001",
+                                "agent": "FormatterAgent",
+                                "description": f"Respond to user: {query[:80]}",
+                                "agent_prompt": f"The user said: \"{query}\". Respond naturally and helpfully. If it's a greeting, greet them back warmly. Planner note: {reason}",
+                                "reads": ["original_query"],
+                                "writes": ["final_report"],
+                            }],
+                            "edges": [{"source": "Query", "target": "T001"}],
+                        }
+
+                    # ===== AUTO-CLARIFICATION CHECK =====
+                    AUTO_CLARYFY_THRESHOLD = 0.7
+                    confidence = plan_result["output"].get("interpretation_confidence", 1.0)
+                    ambiguity_notes = plan_result["output"].get("ambiguity_notes", [])
+
+                    # Check if Planner already added a ClarificationAgent (avoid duplicates)
+                    plan_nodes = plan_result["output"]["plan_graph"].get("nodes", [])
+                    has_clarification_agent = any(
+                        n.get("agent") == "ClarificationAgent" for n in plan_nodes
+                    )
+
+                    if confidence < AUTO_CLARYFY_THRESHOLD and ambiguity_notes and not has_clarification_agent:
+                        log_step(f"Low confidence ({confidence:.2f}), auto-triggering clarification", symbol="❓")
+
+                        # Get the first step ID from the plan
+                        first_step = plan_result["output"].get("next_step_id", "T001")
+                        clarification_write_key = "user_clarification_T000"
+
+                        # Create clarification node
+                        clarification_node = {
+                            "id": "T000_AutoClarify",
+                            "agent": "ClarificationAgent",
+                            "description": "Clarify ambiguous requirements before proceeding",
+                            "agent_prompt": f"The system has identified ambiguities in the user's request. Please ask for clarification on: {'; '.join(ambiguity_notes)}",
+                            "reads": [],
+                            "writes": [clarification_write_key],
+                            "status": "pending"
+                        }
+                        # Insert the ClarificationAgent node at the start of the plan
+                        plan_result["output"]["plan_graph"]["nodes"].insert(0, clarification_node)
+                        plan_result["output"]["plan_graph"]["edges"].insert(0, {
+                            "source": "T000_AutoClarify",
+                            "target": first_step
+                        })
+
+                        for node in plan_result["output"]["plan_graph"]["nodes"]:
+                            if node.get("id") == first_step:
+                                if "reads" not in node:
+                                    node["reads"] = []
+                                if clarification_write_key not in node["reads"]:
+                                    node["reads"].append(clarification_write_key)
+                                    log_step(f"Wired {clarification_write_key} into {first_step}'s reads", symbol="🔗")
+                                break
+
+                        plan_result["output"]["next_step_id"] = "T000_AutoClarify"
+                        log_step(f"Injected ClarificationAgent before {first_step}", symbol="➕")
+                    elif has_clarification_agent:
+                        log_step(f"Planner already added ClarificationAgent, skipping auto-injection", symbol="ℹ️")
+
+                    # ✅ Mark Query/Planner as Done
+                    self.context.plan_graph.nodes["Query"]["output"] = plan_result["output"]
+                    self.context.plan_graph.nodes["Query"]["status"] = "completed"
+                    self.context.plan_graph.nodes["Query"]["end_time"] = datetime.utcnow().isoformat()
+
+                    # 🟢 PHASE 3: EXPAND GRAPH
+                    new_plan_graph = plan_result["output"]["plan_graph"]
+                    self._merge_plan_into_context(new_plan_graph)
+
+                    try:
+                        # WATCHTOWER: DAG execution span (contains execute_node spans)
+                        with agent_execute_dag_span(
+                            session_id=self.context.plan_graph.graph.get("session_id", ""),
+                        ):
+                            await self._track_task(self._execute_dag(self.context))
+
+                        if self.context.stop_requested:
+                            break
+
+                        if self._should_replan():
+                            log_step("♻️ Adaptive Re-planning: Clarification resolved, formulating next steps...", symbol="🔄")
+                            # Mark processed clarification leaves so they don't re-trigger
+                            for nid, nd in self.context.plan_graph.nodes(data=True):
+                                if (nd.get("agent") == "ClarificationAgent"
+                                        and nd.get("status") == "completed"
+                                        and not list(self.context.plan_graph.successors(nid))):
+                                    nd["_replan_consumed"] = True
+                            self.context.plan_graph.nodes["Query"]["status"] = "running"
+                            self.context._save_session()
+                            await asyncio.sleep(0.1)  # yield to event loop
+                            continue
+                        else:
+                            return self.context
+
+                    except (Exception, asyncio.CancelledError) as e:
+                        if isinstance(e, asyncio.CancelledError) or self.context.stop_requested:
+                            log_step("🛑 Execution interrupted/stopped.", symbol="🛑")
+                            break
+                        span.set_status(Status(StatusCode.ERROR, str(e)))
+                        span.record_exception(e)
+                        print(f"❌ ERROR during execution: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        raise
+            except (Exception, asyncio.CancelledError) as e:
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                span.record_exception(e)
+                if self.context:
+                    final_status = "stopped" if (self.context.stop_requested or isinstance(e, asyncio.CancelledError)) else "failed"
+                    for node_id in self.context.plan_graph.nodes:
+                        if self.context.plan_graph.nodes[node_id].get("status") in ["running", "pending"]:
+                            self.context.plan_graph.nodes[node_id]["status"] = final_status
+                            if final_status == "failed":
+                                self.context.plan_graph.nodes[node_id]["error"] = str(e)
+
+                    self.context.plan_graph.graph['status'] = final_status
+                    if final_status == "failed":
+                        self.context.plan_graph.graph['error'] = str(e)
+                    self.context._save_session()
+                if not isinstance(e, asyncio.CancelledError) and not self.context.stop_requested:
+                    raise e
+                return self.context
+
+    def _should_replan(self):
+        """
+        Check if the graph needs expansion (re-planning).
+        Conditions:
+        1. All current nodes are finished (completed/skipped).
+        2. At least one ClarificationAgent recently completed (and not yet consumed).
+        3. That ClarificationAgent was a 'leaf' (had no successors in the current graph).
+        """
+        # If any node is still pending/running, we aren't at a dead end yet
+        if not self.context.all_done():
+            return False
+
+        has_new_leaf_clarification = False
+        for node_id, node_data in self.context.plan_graph.nodes(data=True):
+            if (node_data.get("agent") == "ClarificationAgent"
+                    and node_data.get("status") == "completed"
+                    and not node_data.get("_replan_consumed")):
+                # Check if it was a leaf node (no arrows coming out)
+                if not list(self.context.plan_graph.successors(node_id)):
+                    has_new_leaf_clarification = True
+                    break
+
+        return has_new_leaf_clarification
+
+    def _merge_plan_into_context(self, new_plan_graph):
+        """Merge the planned nodes into the existing bootstrap context"""
+        new_nodes = new_plan_graph.get("nodes", [])
+        new_edges = new_plan_graph.get("edges", [])
+        
+        # Track which new nodes have incoming edges to detect orphans
+        nodes_with_incoming_edges = set()
+
+        # Add new nodes
+        for node in new_nodes:
+            # Prepare node data with defaults
+            node_data = node.copy()
+            # Set defaults if not present in the plan
+            defaults = {
+                'status': 'pending',
+                'output': None,
+                'error': None,
+                'cost': 0.0,
+                'start_time': None,
+                'end_time': None,
+                'execution_time': 0.0
+            }
+            for k, v in defaults.items():
+                node_data.setdefault(k, v)
+                
+            # Avoid overwriting already completed nodes if they somehow appear in the new plan
+            if node["id"] in self.context.plan_graph:
+                 existing_status = self.context.plan_graph.nodes[node["id"]].get("status")
+                 if existing_status == "completed":
+                      continue
+
+            self.context.plan_graph.add_node(node["id"], **node_data)
+            
+        # Add new edges (redirect ROOT -> First Step to Query -> First Step)
+        for edge in new_edges:
+            # Robustly handle different edge formats or missing keys
+            source = edge.get("source") or edge.get("from")
+            target = edge.get("target") or edge.get("to")
+            
+            if not source or not target:
+                log_step(f"⚠️ Skipping malformed edge: {edge}", symbol="⚠️")
+                continue
+            
+            # Redirect dependencies: If a node depends on ROOT, make it depend on Query
+            if source == "ROOT":
+                source = "Query"
+
+            self.context.plan_graph.add_edge(source, target)
+            nodes_with_incoming_edges.add(target)
+        
+        # 🛡️ AUTO-CONNECT: If a new node has NO incoming edges, connect it to "Query"
+        # This fixes cases where PlannerAgent returns nodes but forgets the edges
+        for node in new_nodes:
+            if node["id"] not in nodes_with_incoming_edges:
+                log_step(f"🔗 Auto-connected orphan node {node['id']} to Query", symbol="🔗")
+                self.context.plan_graph.add_edge("Query", node["id"])
+        
+        # 🔧 SAFETY NET: Ensure ClarificationAgent outputs are wired to successor nodes
+        # This fixes cases where Planner adds a ClarificationAgent but forgets to wire reads
+        for node in new_nodes:
+            if node.get("agent") == "ClarificationAgent":
+                clarification_node_id = node["id"]
+                clarification_writes = node.get("writes", [])
+                
+                if not clarification_writes:
+                    continue
+                    
+                # Find all successor nodes (nodes that this ClarificationAgent points to)
+                for edge in new_edges:
+                    if edge.get("source") == clarification_node_id:
+                        successor_id = edge.get("target")
+                        if not successor_id:
+                            continue
+                        
+                        # Find the successor node and ensure it reads from clarification
+                        for succ_node in new_nodes:
+                            if succ_node.get("id") == successor_id:
+                                if "reads" not in succ_node:
+                                    succ_node["reads"] = []
+                                
+                                for write_key in clarification_writes:
+                                    if write_key not in succ_node["reads"]:
+                                        succ_node["reads"].append(write_key)
+                                        log_step(f"🔗 Auto-wired {write_key} into {successor_id}'s reads", symbol="🔗")
+                                        
+                                        # Also update the node in the graph if already added
+                                        if successor_id in self.context.plan_graph:
+                                            if "reads" not in self.context.plan_graph.nodes[successor_id]:
+                                                self.context.plan_graph.nodes[successor_id]["reads"] = []
+                                            if write_key not in self.context.plan_graph.nodes[successor_id]["reads"]:
+                                                self.context.plan_graph.nodes[successor_id]["reads"].append(write_key)
+                                break
+        
+        self.context._save_session()
+        log_step("✅ Plan merged into execution context", symbol="🌳")
+
+    async def _execute_dag(self, context):
+        """Execute DAG with visualization - DEBUGGING MODE"""
+        
+        # Get plan_graph structure for visualization
+        plan_graph = {
+            "nodes": [
+                {"id": node_id, **node_data} 
+                for node_id, node_data in context.plan_graph.nodes(data=True)
+            ],
+            "links": [
+                {"source": source, "target": target}
+                for source, target in context.plan_graph.edges()
+            ]
+        }
+        
+        # Create visualizer
+        visualizer = ExecutionVisualizer(plan_graph)
+        console = Console()
+        
+        # 🔧 DEBUGGING MODE: No Live display, just regular prints
+        max_iterations = self.max_steps
+        iteration = 0
+        
+        # ===== COST THRESHOLD ENFORCEMENT =====
+        from config.settings_loader import reload_settings
+        settings = reload_settings()
+        max_cost = settings.get("agent", {}).get("max_cost_per_run", 0.50)
+        warn_cost = settings.get("agent", {}).get("warn_at_cost", 0.25)
+        cost_warning_shown = False
+
+        while not context.all_done():
+            if context.stop_requested:
+                console.print("[yellow]🛑 Aborting execution: Cleaning up nodes...[/yellow]")
+                # Cleanup: Mark any 'running' nodes as 'stopped' to prevent zombie spinners in UI
+                for n_id in context.plan_graph.nodes:
+                    if context.plan_graph.nodes[n_id].get("status") == "running":
+                        context.plan_graph.nodes[n_id]["status"] = "stopped"
+                context._save_session()
+                break
+            
+            # Get ready nodes
+            ready_steps = context.get_ready_steps()
+            
+            # 🛡️ DEFENSIVE: Filter out steps that are not pending (prevents loops)
+            ready_steps = [s for s in ready_steps if context.plan_graph.nodes[s]["status"] == "pending"]
+            
+            if not ready_steps:
+                # Check for running steps or waiting steps
+                running_or_waiting = any(
+                    context.plan_graph.nodes[n]['status'] in ['running', 'waiting_input']
+                    for n in context.plan_graph.nodes
+                )
+                
+                if not running_or_waiting:
+                    # No ready steps and nothing running - check for orphans or completion
+                    is_complete = all(
+                        context.plan_graph.nodes[n]['status'] in ['completed', 'skipped', 'cost_exceeded']
+                        for n in context.plan_graph.nodes
+                        if n != "ROOT"
+                    )
+                    if is_complete:
+                        break
+                
+                # Poll until we have work or completion
+                await asyncio.sleep(0.5)
+                continue
+
+            # Show current state (only when we found work to do)
+            try:
+                console.print(visualizer.get_layout())
+            except Exception as e:
+                console.print(f"[dim]Note: Could not refresh terminal UI: {e}[/dim]")
+
+            # Mark running
+            for step_id in ready_steps:
+                visualizer.mark_running(step_id)
+                context.mark_running(step_id)
+            
+            # ✅ EXECUTE AGENTS FOR REAL
+            # Run each ready step concurrently (asyncio.gather)
+            tasks = []
+            for step_id in ready_steps:
+                # Log step start with description
+                step_data = context.get_step_data(step_id)
+                desc = step_data.get("agent_prompt", step_data.get("description", "No description"))[:60]
+                log_step(f"🔄 Starting {step_id} ({step_data['agent']}): {desc}...", symbol="🚀")
+                
+                visualizer.mark_running(step_id)
+                context.mark_running(step_id)
+                tasks.append(self._track_task(self._execute_step(step_id, context)))
+
+            results = await self._track_task(asyncio.gather(*tasks, return_exceptions=True))
+
+            # Step-level retry configuration
+            MAX_STEP_RETRIES = 2
+            
+            # Process results (with step-level retry)
+            for step_id, result in zip(ready_steps, results):
+                step_data = context.get_step_data(step_id)
+                retry_count = step_data.get('_retry_count', 0)
+                
+                # ✅ HANDLE AWAITING INPUT
+                if isinstance(result, dict) and result.get("status") == "waiting_input":
+                     visualizer.mark_waiting(step_id) 
+                     context.plan_graph.nodes[step_id]["status"] = "waiting_input"
+                     # Preserve partial output
+                     if "output" in result:
+                         context.plan_graph.nodes[step_id]["output"] = result["output"]
+                     context._save_session()
+                     log_step(f"⏳ {step_id}: Waiting for user input...", symbol="⏳")
+                     continue
+                
+                if isinstance(result, Exception):
+                    # Check if we should retry this step
+                    if retry_count < MAX_STEP_RETRIES:
+                        step_data['_retry_count'] = retry_count + 1
+                        context.plan_graph.nodes[step_id]['status'] = 'pending'  # Reset to pending for retry
+                        log_step(f"🔄 Retrying {step_id} (attempt {retry_count + 1}/{MAX_STEP_RETRIES}): {str(result)}", symbol="🔄")
+                    else:
+                        visualizer.mark_failed(step_id, result)
+                        context.mark_failed(step_id, str(result))
+                        log_error(f"❌ Failed {step_id} after {MAX_STEP_RETRIES} retries: {str(result)}")
+                        # 📼 Chronicle: emit STEP_FAILED + create checkpoint
+                        try:
+                            from session.capture import get_capture
+                            from session.schema import EventType
+                            from session.checkpoint import create_checkpoint
+                            _chronicle = get_capture()
+                            _sid = context.plan_graph.graph.get("session_id", "unknown")
+                            await _chronicle.emit(
+                                EventType.STEP_FAILED,
+                                {"step_id": step_id, "agent": step_data.get("agent", ""), "error": str(result)},
+                                session_id=_sid,
+                            )
+                            create_checkpoint(_sid, "step_failed", context.plan_graph, last_sequence=_chronicle.get_last_sequence(_sid))
+                        except Exception:
+                            pass
+                elif result["success"]:
+                    visualizer.mark_completed(step_id)
+                    await context.mark_done(step_id, result["output"])
+                    log_step(f"✅ Completed {step_id} ({step_data['agent']})", symbol="✅")
+                    # 📼 Chronicle: emit STEP_COMPLETE + create checkpoint
+                    try:
+                        from session.capture import get_capture
+                        from session.schema import EventType
+                        from session.checkpoint import create_checkpoint
+                        _chronicle = get_capture()
+                        _sid = context.plan_graph.graph.get("session_id", "unknown")
+                        _node = context.plan_graph.nodes[step_id]
+                        await _chronicle.emit(
+                            EventType.STEP_COMPLETE,
+                            {
+                                "step_id": step_id,
+                                "agent": step_data.get("agent", ""),
+                                "cost": _node.get("cost", 0.0),
+                                "input_tokens": _node.get("input_tokens", 0),
+                                "output_tokens": _node.get("output_tokens", 0),
+                                "execution_time_sec": _node.get("execution_time", 0.0),
+                                "status": "completed",
+                            },
+                            session_id=_sid,
+                        )
+                        create_checkpoint(_sid, "step_complete", context.plan_graph, last_sequence=_chronicle.get_last_sequence(_sid))
+                    except Exception:
+                        pass
+
+                    # ── Voice streaming: push this node's output immediately ──
+                    # If a stream queue is registered (voice pipeline is listening),
+                    # push speakable text so TTS can start speaking before the full
+                    # run completes — true incremental streaming.
+                    try:
+                        from shared.state import has_stream_queue, push_stream_chunk
+                        session_id_for_stream = context.plan_graph.graph.get("session_id", "")
+                        if session_id_for_stream and has_stream_queue(session_id_for_stream):
+                            _chunk = _extract_node_chunk(step_id, step_data["agent"], result["output"])
+                            if _chunk:
+                                push_stream_chunk(session_id_for_stream, _chunk)
+                    except Exception as _ve:
+                        print(f"⚠️ [Voice] Failed to push stream chunk for {step_id}: {_ve}")
+                else:
+                    # Agent returned failure - also retry
+                    if retry_count < MAX_STEP_RETRIES:
+                        step_data['_retry_count'] = retry_count + 1
+                        context.plan_graph.nodes[step_id]['status'] = 'pending'
+                        log_step(f"🔄 Retrying {step_id} (attempt {retry_count + 1}/{MAX_STEP_RETRIES}): {result['error']}", symbol="🔄")
+                    else:
+                        visualizer.mark_failed(step_id, result["error"])
+                        context.mark_failed(step_id, result["error"])
+                        log_error(f"❌ Failed {step_id} after {MAX_STEP_RETRIES} retries: {result['error']}")
+                        # 📼 Chronicle: emit STEP_FAILED + create checkpoint
+                        try:
+                            from session.capture import get_capture
+                            from session.schema import EventType
+                            from session.checkpoint import create_checkpoint
+                            _chronicle = get_capture()
+                            _sid = context.plan_graph.graph.get("session_id", "unknown")
+                            await _chronicle.emit(
+                                EventType.STEP_FAILED,
+                                {"step_id": step_id, "agent": step_data.get("agent", ""), "error": result.get("error", "")},
+                                session_id=_sid,
+                            )
+                            create_checkpoint(_sid, "step_failed", context.plan_graph, last_sequence=_chronicle.get_last_sequence(_sid))
+                        except Exception:
+                            pass
+
+            # ===== COST THRESHOLD CHECK =====
+            accumulated_cost = sum(
+                context.plan_graph.nodes[n].get('cost', 0) 
+                for n in context.plan_graph.nodes
+                if context.plan_graph.nodes[n].get('status') == 'completed'
+            )
+            
+            # Warning threshold
+            if not cost_warning_shown and accumulated_cost >= warn_cost:
+                log_step(f"⚠️ Cost Warning: ${accumulated_cost:.4f} (threshold: ${warn_cost:.2f})", symbol="💰")
+                cost_warning_shown = True
+            
+            # Hard stop threshold
+            if accumulated_cost >= max_cost:
+                log_error(f"🛑 Cost Exceeded: ${accumulated_cost:.4f} > ${max_cost:.2f}")
+                context.plan_graph.graph['status'] = 'cost_exceeded'
+                context.plan_graph.graph['final_cost'] = accumulated_cost
+                break
+                
+            iteration += 1
+            # Only trigger max-iteration guard when there's no forward progress
+            # (prevents false alarm when tasks are completing normally)
+            completed_now = sum(
+                1 for n in context.plan_graph.nodes
+                if context.plan_graph.nodes[n].get('status') in ('completed', 'skipped', 'cost_exceeded')
+                and n != "ROOT"
+            )
+            if not hasattr(context, '_last_completed_count'):
+                context._last_completed_count = 0
+            if completed_now > context._last_completed_count:
+                # Forward progress — reset the stall counter
+                context._last_completed_count = completed_now
+                iteration = 0
+            if iteration >= max_iterations:
+                log_error(f"🛑 Max Iterations Reached: {iteration}/{max_iterations}")
+                context.plan_graph.graph['status'] = 'failed'
+                break
+
+        # Final state: render layout and persist status
+        console.print(visualizer.get_layout())
+        
+        # Determine and save final status (stopped/failed/completed)
+        if context.stop_requested:
+             context.plan_graph.graph['status'] = 'stopped'
+        elif any(context.plan_graph.nodes[n]['status'] == 'failed' for n in context.plan_graph.nodes):
+             context.plan_graph.graph['status'] = 'failed'
+        elif context.all_done():
+             context.plan_graph.graph['status'] = 'completed'
+        else:
+             # Max iterations or stalled
+             context.plan_graph.graph['status'] = 'failed'
+        
+        context._auto_save()
+        
+        if context.all_done():
+            # 🧠 Save Episodic Memory (Skeleton)
+            try:
+                from core.episodic_memory import EpisodicMemory
+                import networkx as nx
+                from memory.user_id import get_user_id
+                mem = EpisodicMemory()
+                graph_data = nx.node_link_data(context.plan_graph)
+                session_data = {"graph": graph_data}
+                space_id_val = context.plan_graph.graph.get("space_id")
+                await mem.save_episode(session_data, space_id=space_id_val, user_id=get_user_id())
+            except Exception as e:
+                print(f"⚠️ Failed to save episodic memory: {e}")
+
+            console.print("🎉 All tasks completed!")
+
+    async def _execute_step(self, step_id, context):
+        """
+        Execute a single step in the DAG: emit step_start, get inputs from graph, run agent
+        (with retries), handle tool calls and iterations. Returns success/failure with output.
+
+        WATCHTOWER: Span for each agent step (PlannerAgent, CoderAgent, FormatterAgent, etc.).
+        - Span name: agent_loop.execute_node
+        - Attributes: node_id, agent type, session_id
+        - LLM calls inside the agent become children of this span
+        """
+        step_data = context.get_step_data(step_id)
+
+        # 📼 Chronicle: emit STEP_START
+        try:
+            from session.capture import get_capture
+            from session.schema import EventType
+            _chronicle = get_capture()
+            session_id = context.plan_graph.graph.get("session_id", "unknown")
+            await _chronicle.emit(
+                EventType.STEP_START,
+                {
+                    "step_id": step_id,
+                    "agent": step_data.get("agent", ""),
+                    "description": step_data.get("description", ""),
+                },
+                session_id=session_id,
+            )
+        except Exception:
+            pass
+        agent_type = step_data["agent"]
+        session_id_val = context.plan_graph.graph.get("session_id", "")
+        retry_attempt = step_data.get("_retry_count", 0)
+        with agent_execute_node_span(step_id, agent_type, session_id_val, retry_attempt=retry_attempt) as span:
+            # 📡 EMIT EVENT
+            await event_bus.publish("step_start", "AgentLoop4", {"step_id": step_id})
+
+            # Get inputs from NetworkX graph
+            inputs = context.get_inputs(step_data.get("reads", []))
+
+            # 🔧 HELPER FUNCTION: Build agent input (consistent for both iterations)
+            def build_agent_input(instruction=None, previous_output=None, iteration_context=None):
+                payload = {
+                    "step_id": step_id,
+                    "agent_prompt": instruction or step_data.get("agent_prompt", step_data["description"]),
+                    "reads": step_data.get("reads", []),
+                    "writes": step_data.get("writes", []),
+                    "inputs": inputs,
+                    "original_query": context.plan_graph.graph['original_query'],
+                    "session_context": {
+                        "session_id": context.plan_graph.graph['session_id'],
+                        "created_at": context.plan_graph.graph['created_at'],
+                        "file_manifest": context.plan_graph.graph['file_manifest'],
+                        "memory_context": getattr(context, 'memory_context', None)
+                    },
+                    **({"previous_output": previous_output} if previous_output else {}),
+                    **({"iteration_context": iteration_context} if iteration_context else {})
+                }
+                if agent_type == "FormatterAgent":
+                    payload["all_globals_schema"] = context.plan_graph.graph['globals_schema'].copy()
+                return payload
+
+            max_turns = 15
+            current_input = build_agent_input()
+            iterations_data = []
+
+            # ReAct loop: agent can call tools, call_self, or produce final output
+            for turn in range(1, max_turns + 1):
+                with agent_iteration_span(step_id, agent_type, session_id_val, turn, max_turns) as iter_span:
+                    log_step(f"🔄 {agent_type} Iteration {turn}/{max_turns}", symbol="🔄")
+
+                    # Run agent step (with retries for transient failures)
+                    async def run_agent_step():
+                        return await self.agent_runner.run_agent(agent_type, current_input)
+
+                    def on_retry(attempt):
+                        iter_span.set_attribute("retry_attempt", attempt)
+                        iter_span.set_attribute("is_retry", True)
+
+                    try:
+                        result = await retry_with_backoff(run_agent_step, on_retry=on_retry)
+                    except Exception as e:
+                        span.set_status(Status(StatusCode.ERROR, str(e)))
+                        span.record_exception(e)
+                        return {"success": False, "error": f"Agent failed after retries: {str(e)}"}
+
+                    if not result["success"]:
+                        iter_span.set_attribute("trigger", "error")
+                        return result
+
+                    output = result["output"]
+
+                    # Clarification requested - pause for user input
+                    if output.get("clarificationMessage"):
+                        iter_span.set_attribute("trigger", "clarification")
+                        return {
+                            "success": True,
+                            "status": "waiting_input",
+                            "output": output
+                        }
+
+                    iterations_data.append({"iteration": turn, "output": output})
+
+                    if context.stop_requested:
+                        iter_span.set_attribute("trigger", "stopped")
+                        log_step(f"🛑 {agent_type}: Stop requested, aborting iteration {turn}", symbol="🛑")
+                        return {"success": False, "error": "Stop requested"}
+
+                    step_data = context.get_step_data(step_id)
+                    step_data['iterations'] = iterations_data
+
+                    # 1. Check for 'call_tool' (ReAct)
+                    if output.get("call_tool"):
+                        iter_span.set_attribute("trigger", "tool_call")
+                        tool_call = output["call_tool"]
+                        tool_name = tool_call.get("name")
+                        tool_args = tool_call.get("arguments", {})
+
+                        log_step(f"🛠️ Executing Tool: {tool_name}", payload=tool_args, symbol="⚙️")
+
+                        tool_executed = False
+                        skill_tool_result = None
+
+                        # Try local skill tools first, then MCP route
+                        try:
+                            from core.registry import AgentRegistry
+                            from shared.state import get_skill_manager
+
+                            agent_config = AgentRegistry.get(agent_type)
+                            skill_mgr = get_skill_manager()
+
+                            if agent_config and "skills" in agent_config:
+                                possible_skills = agent_config["skills"]
+                                for skill_name in possible_skills:
+                                    skill = skill_mgr.get_skill(skill_name)
+                                    if skill:
+                                        for tool in skill.get_tools():
+                                            if getattr(tool, 'name', None) == tool_name:
+                                                log_step(f"🧩 Executing Local Skill Tool: {tool_name}", symbol="🧩")
+                                                if asyncio.iscoroutinefunction(tool.func):
+                                                    skill_tool_result = await tool.func(**tool_args)
+                                                else:
+                                                    skill_tool_result = tool.func(**tool_args)
+                                                tool_executed = True
+                                                break
+                                    if tool_executed:
+                                        break
+
+                        except Exception as e:
+                            log_error(f"Local Skill Tool Execution Failed: {e}")
+                            tool_executed = True
+                            skill_tool_result = f"Error executing local skill tool: {str(e)}"
+
+                        # Execute tool via MCP when not a local skill
+                        if not tool_executed:
+                            try:
+                                mcp_result = await self.multi_mcp.route_tool_call(tool_name, tool_args)
+                                if hasattr(mcp_result, 'content'):
+                                    if isinstance(mcp_result.content, list):
+                                        skill_tool_result = "\n".join([str(item.text) for item in mcp_result.content if hasattr(item, "text")])
+                                    else:
+                                        skill_tool_result = str(mcp_result.content)
+                                else:
+                                    skill_tool_result = str(mcp_result)
+                            except Exception as e:
+                                log_error(f"Tool Execution Failed: {e}")
+                                current_input = build_agent_input(
+                                    instruction="The tool execution failed. Try a different approach or tool.",
+                                    previous_output=output,
+                                    iteration_context={"tool_result": f"Error: {str(e)}"}
+                                )
+                                continue
+
+                        # Feed tool result back to agent for next iteration
+                        result_str = str(skill_tool_result)
+                        iterations_data[-1]["tool_result"] = result_str
+                        log_step(f"✅ Tool Result", payload={"result_preview": result_str[:200] + "..."}, symbol="🔌")
+                        instruction = output.get("thought", "Use the tool result to generate the final output.")
+                        if turn == max_turns - 1:
+                            instruction += " \n\n⚠️ WARNING: This is your FINAL turn. You MUST provide the final 'output' now. Do not call any more tools. Summarize what you have."
+                        current_input = build_agent_input(
+                            instruction=instruction,
+                            previous_output=output,
+                            iteration_context={"tool_result": result_str}
+                        )
+                        continue
+
+                    # 2. Check for call_self (Legacy/Advanced recursion)
+                    elif output.get("call_self"):
+                        iter_span.set_attribute("trigger", "call_self")
+                        if context._has_executable_code(output):
+                            execution_result = await context._auto_execute_code(step_id, output)
+                            iterations_data[-1]["execution_result"] = execution_result
+                            if execution_result.get("status") == "success":
+                                execution_data = execution_result.get("result", {})
+                                inputs = {**inputs, **execution_data}
+                        current_input = build_agent_input(
+                            instruction=output.get("next_instruction", "Continue the task"),
+                            previous_output=output,
+                            iteration_context=output.get("iteration_context", {})
+                        )
+                        continue
+
+                    # 3. Final output (no tool/self call) - execute code if present, then return
+                    else:
+                        iter_span.set_attribute("trigger", "final")
+                        if context.stop_requested:
+                            return {"success": False, "error": "Stop requested"}
+                        if context._has_executable_code(output):
+                            execution_result = await context._auto_execute_code(step_id, output)
+                            iterations_data[-1]["execution_result"] = execution_result
+
+                            # If code execution FAILED, retry with error feedback instead of returning broken output
+                            if execution_result.get("status") == "error" and turn < max_turns:
+                                exec_error = execution_result.get("error", "Unknown error")
+                                log_step(f"⚠️ Code execution failed for {step_id}: {exec_error[:200]}. Retrying...", symbol="🔄")
+                                current_input = build_agent_input(
+                                    instruction=(
+                                        f"Your code execution FAILED with this error:\n\n```\n{exec_error}\n```\n\n"
+                                        "Fix the code and try again. Make sure you only use functions/variables that are available in the sandbox. "
+                                        "Available tools must be called via `call_tool`, not as Python functions."
+                                    ),
+                                    previous_output=output,
+                                    iteration_context={"execution_error": exec_error}
+                                )
+                                continue  # Retry in next iteration
+
+                            # Merge so mark_done skips re-execution (avoids duplicate code.execution span)
+                            output = context._merge_execution_results(output, execution_result)
+                        return {"success": True, "output": output}
+
+            log_error(f"Max iterations ({max_turns}) reached for {step_id}. Returning last output (incomplete).")
+        last_output = iterations_data[-1]["output"] if iterations_data else {"error": "No output produced"}
+        # Ensure it has a valid structure if possible, or just pass it through
+        return {"success": True, "output": last_output}
+
+    async def _handle_failures(self, context):
+        """Handle failures via mid-session replanning"""
+        # TODO: Implement mid-session replanning with PlannerAgent
+        log_error("Mid-session replanning not yet implemented")

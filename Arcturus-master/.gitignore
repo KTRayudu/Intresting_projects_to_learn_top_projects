@@ -1,0 +1,135 @@
+# Dependencies & Environments
+node_modules/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.bin
+*.onnx
+
+# Build Artifacts
+platform-frontend/dist/
+platform-frontend/build/
+dist/
+build/
+.bin/
+# Agents & State
+**/__pycache__/
+*.pyc
+action/sandbox_state/
+memory/remme_index/index.bin
+memory/chronicle_checkpoints/
+memory/chronicle_index/
+memory/chronicle_events/
+memory/remme_index/memories.json
+memory/remme_index/scanned_runs.json
+memory/remme_index/device_id.json
+memory/remme_index/user_id.json
+memory/remme_index/user_profile.md
+memory/user_model/
+memory/chronicle_checkpoints/
+memory/chronicle_events/
+**/cpython-*.pyc
+
+
+
+# Data & Documents (Large files/datasets)
+data/
+/documents/
+mcp_servers/documents/
+mcp_servers/faiss_index/
+classNotes/
+Notes/
+
+# Allow only specific code-related data if needed (example: whitelisting notes)
+!data/Notes/
+!Notes/
+
+# Logs & Runtime State
+memory/session_summaries_index/
+memory/debug_logs/
+memory/chronicle_checkpoints/
+memory/chronicle_events/
+!memory/*.py
+*.log
+server.log
+benchmark_results.txt
+S15A.egg-info/
+
+# Environment Secrets
+.env
+.env.*
+!.env.example
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Brain / Agent Internal
+.gemini/
+.agent/
+
+# Binary Files & Media
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.pdf
+*.docx
+*.doc
+*.pptx
+*.ppt
+*.xlsx
+*.xls
+*.zip
+*.tar
+*.gz
+
+# Whitelist Static Assets for Frontend
+!docs/*.png
+!docs/*.jpg
+!docs/*.jpeg
+!docs/*.webp
+!platform-frontend/public/*.svg
+!platform-frontend/public/*.ico
+!platform-frontend/public/*.png
+!platform-frontend/public/*.jpg
+
+# Studio runtime output (generated PPTX artifacts)
+/studio/
+
+# Auto-generated skill registry (rebuilt on every startup by SkillManager)
+core/skills/registry.json
+
+# Added by Arcturus
+.arcturus/
+.arcturus
+
+# Other personal files
+HOWTOGETSLACKBOT.md
+P01-Delivery-Status.md
+
+# Project 13: Orbit - Local State & Private Drafts
+Canvas_Pic_Current.json
+memory/remme_staging.json
+memory/episodes/
+
+# Runtime state (machine-specific, changes every run)
+memory/matrix_since_token.txt
+memory/chronicle_events/
+memory/chronicle_checkpoints/
+
+# PR Body Drafts
+scripts/github/PR_body*.md
+scripts/github/Pr_Body*.md
+scripts/github/PR_Body_*.md
+scripts/github/Pr_Body_*.md
+.voice_sessions/
