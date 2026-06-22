@@ -1,0 +1,45 @@
+# .github/labeler.yml
+06-workshops:
+  - "06-workshops/**"
+02-use-cases:
+  - "02-use-cases/**"
+03-integrations:
+  - "03-integrations/**"
+01-AgentCore-runtime:
+  - "06-workshops/01-AgentCore-runtime/**"
+02-AgentCore-gateway:
+  - "06-workshops/02-AgentCore-gateway/**"
+03-AgentCore-identity:
+  - "06-workshops/03-AgentCore-identity/**"
+04-AgentCore-memory:
+  - "06-workshops/04-AgentCore-memory/**"
+05-AgentCore-tools:
+  - "06-workshops/05-AgentCore-tools/**"
+06-AgentCore-observability:
+  - "06-workshops/06-AgentCore-observability/**"
+07-AgentCore-E2E:
+  - "06-workshops/07-AgentCore-E2E/**"
+asynchronous-shopping-assistant:
+  - "02-use-cases/asynchronous-shopping-assistant/**"
+AWS-operations-agent:
+  - "02-use-cases/AWS-operations-agent/**"
+customer-support-assistant:
+  - "02-use-cases/customer-support-assistant/**"
+DB-performance-analyzer:
+  - "02-use-cases/DB-performance-analyzer/**"
+device-management-agent:
+  - "02-use-cases/device-management-agent/**"
+healthcare-appointment-agent:
+  - "02-use-cases/healthcare-appointment-agent/**"
+local-prototype-to-agentcore:
+  - "02-use-cases/local-prototype-to-agentcore/**"
+SRE-agent:
+  - "02-use-cases/SRE-agent/**"
+text-to-python-ide:
+  - "02-use-cases/text-to-python-ide/**"
+video-games-sales-assistant:
+  - "02-use-cases/video-games-sales-assistant/**"
+bedrock-agent:
+  - "03-integrations/bedrock-agent/**"
+agentic-frameworks:
+  - "03-integrations/agentic-frameworks/**"

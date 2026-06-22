@@ -1,0 +1,50 @@
+{
+	"info": {
+		"_postman_id": "faa8698d-e2cb-4513-be8f-95c74888b3c3",
+		"name": "Freight_X01",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "45489688",
+		"_collection_link": "https://krish-6906038.postman.co/workspace/GVP~e8baab2b-b5a8-45d1-8005-7faad2222acb/collection/45489688-faa8698d-e2cb-4513-be8f-95c74888b3c3?action=share&source=collection_link&creator=45489688"
+	},
+	"item": [
+		{
+			"name": "https://qagvp.intellitrans.com/gvp/public/api/FreightRates/createmanagementinvoice",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "tokenID",
+						"value": "tlSdV+SBvvy/MwjQAs1fekmqCuDVswojv2Lo9mMBKMFQAZvqWYaNEX5d8Gic3SulIclwFy9O56lFGC11aLmRj6ZrezhxBRro1I160qSePYm1/W+eWCe6QHKxAueX9WqZP8pj00Xf48fPvhnTq0JhrFGfV5jSwpA9mgQf8egpgjN5tA4UXKaYSOGCx8ledBE9OPT9J3fWC8UGQzu6mE4mSngW0QxGSD2EDFOu+8grxFXqndMbHmdwyqZjI8OzGZCuhVDRQYI6oxNgmQf9Bl06XtFbvy7uYaouZ5V/SEYG+GBXEHKONh1ASw5GzLDLkcdUktaomAI8bw0SCR13fSdNqA==",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n  \"InvoiceDate\": \"10/212025\",\r\n  \"InvoiceNumber\": \"1234567\",\r\n  \"Carrier\": \"BNSF\",\r\n  \"Currency\": \"USD\",\r\n  \"FeeAmount\": \"1250.75\",\r\n  \"PartyName\": \"Procter & Gamble (P&G)\",\r\n  \"MailboxName\": \"Procter & Gamble (P&G)\",  \r\n  \"FleetID\": \"FLEET-0098\",\r\n  \"GLAccount\": \"4500\",\r\n  \"CostCenter\": \"CST-220\",\r\n  \"BOLNumber\": \"BOL-554433\",\r\n  \"OriginCity\": \"Atlanta\",\r\n  \"OriginState\": \"GA\",\r\n  \"DestinationCity\": \"Chicago\",\r\n  \"DestinationState\": \"IL\",\r\n  \"Comments\": \"Invoice auto-created from OCR data.\",\r\n  \"STCC\": \"123456\",\r\n  \"LeadEquipmentID\": \"TEST777777\",\r\n  \"ServiceDate\": \"2025-1010\",\r\n  \"PDFFilePath\":\"https://abcd.com/test.pdf\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "https://qagvp.intellitrans.com/gvp/public/api/FreightRates/createmanagementinvoice",
+					"protocol": "https",
+					"host": [
+						"qagvp",
+						"intellitrans",
+						"com"
+					],
+					"path": [
+						"gvp",
+						"public",
+						"api",
+						"FreightRates",
+						"createmanagementinvoice"
+					]
+				}
+			},
+			"response": []
+		}
+	]
+}

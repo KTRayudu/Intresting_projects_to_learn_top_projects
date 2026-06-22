@@ -1,0 +1,99 @@
+{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"description": "Freight Carrier Invoice Schema",
+	"class": "Freight Invoice",
+	"type": "object",
+	"definitions": {},
+	"properties": {
+		"InvoiceDate": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the invoice date from the document in mm/dd/yyyy format (e.g., 11/05/2025, 01/15/2024)"
+		},
+		"InvoiceNumber": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the invoice number from the document"
+		},
+		"Carrier": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the carrier name - company that is billing for this service and issued this invoice. Examples: BNSF, UP, CSX, NS, KCS, CP, CN, PGTX"
+		},
+		"Currency": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the currency code used in the invoice. Examples: USD"
+		},
+		"FeeAmount": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract only the numeric value of the total fee amount without currency symbols, commas, or other formatting. Return as plain numbers with decimal point only (e.g., 45335.98 not $45,335.98)"
+		},
+		"PartyName": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the name of the party being billed"
+		},
+		"FleetID": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the fleet identifier code"
+		},
+		"GLAccount": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the general ledger account code"
+		},
+		"CostCenter": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the cost center code"
+		},
+		"BOLNumber": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the bill of lading number"
+		},
+		"OriginCity": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the origin city of the shipment"
+		},
+		"OriginState": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the origin state abbreviation"
+		},
+		"DestinationCity": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the destination city of the shipment"
+		},
+		"DestinationState": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the destination state abbreviation"
+		},
+		"Comments": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract any additional comments or notes from the invoice"
+		},
+		"STCC": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the Standard Transportation Commodity Code (STCC), which is a 7-digit numeric code used to classify the commodity being transported. This is different from SPLC which identifies locations."
+		},
+		"LeadEquipmentID": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the lead equipment identifier"
+		},
+		"ServiceDate": {
+			"type": "string",
+			"inferenceType": "explicit",
+			"instruction": "Extract the service date from the document in mm/dd/yyyy format (e.g., 11/05/2025, 01/15/2024)"
+		}
+	}
+}

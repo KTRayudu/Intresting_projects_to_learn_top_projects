@@ -1,0 +1,29 @@
+{
+  "version": "0",
+  "id": "575d6c76-be83-d761-b416-f3fe514003d7",
+  "detail-type": "Object Created",
+  "source": "aws.s3",
+  "account": "721937028010",
+  "time": "2025-01-18T12:42:45Z",
+  "region": "us-east-1",
+  "resources": [
+    "arn:aws:s3:::devgvpbucket1"
+  ],
+  "detail": {
+    "version": "0",
+    "bucket": {
+      "name": "devgvpbucket1"
+    },
+    "object": {
+      "key": "Invoices/CPKC.pdf",
+      "size": 1024,
+      "etag": "0123456789abcdef0123456789abcdef",
+      "version-id": "djr3H58m77rnfxzJK55kxKGODeZL_7Ug",
+      "sequencer": "0A1B2C3D4E5F678901"
+    },
+    "request-id": "EXAMPLE123456789",
+    "requester": "721937028010",
+    "source-ip-address": "127.0.0.1",
+    "reason": "PutObject"
+  }
+}

@@ -1,0 +1,45 @@
+# =============================================================================
+# Terraform Variables Example
+# =============================================================================
+# Copy this file to terraform.tfvars and fill in your values
+# DO NOT commit terraform.tfvars to version control!
+
+# Environment Configuration
+environment = "dev"
+aws_region  = "us-east-1"
+cost_center = "freight-operations"
+
+# Microsoft 365 Configuration
+azure_client_id     = "your-azure-client-id-here"
+azure_client_secret = "your-azure-client-secret-here"
+azure_tenant_id     = "your-azure-tenant-id-here"
+mailbox_email       = "invoices@yourcompany.com"
+
+# GVP API Configuration
+gvp_login_id = "novaadmin"
+gvp_password = "your-gvp-password-here"
+
+# Bedrock Configuration
+blueprint_name       = "freight-invoice-blueprint"
+bedrock_project_name = "Freight_Audit_Agent"
+
+# Lambda Configuration
+lambda_runtime     = "python3.11"
+lambda_timeout     = 300
+lambda_memory_size = 512
+
+# Scheduler Configuration
+# Every 5 minutes, 8am-6pm EST, Monday-Friday
+email_poll_schedule = "cron(*/5 8-18 ? * MON-FRI *)"
+schedule_timezone   = "America/New_York"
+
+# S3 Configuration
+invoice_s3_prefix = "Invoices/"
+output_s3_prefix  = "Output/"
+
+# CloudWatch Configuration
+log_retention_days = 30
+
+# Alerting Configuration (optional)
+enable_alarms = true
+alert_email   = "ops-team@yourcompany.com"

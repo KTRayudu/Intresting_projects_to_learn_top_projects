@@ -1,0 +1,46 @@
+# Configuration files with sensitive data
+settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+.md
+.pytest_cache
+
+# Testing and Coverage
+htmlcov/
+coverage.xml
+.coverage
+*.cover
+
+# Attachments directory
+attachments/
+requests_msal_layer-a3e0f83c-cd30-44d5-800b-3436a24f3ae8.zip
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+terraform/builds/
+terraform/*.zip
+terraform/crash.log
