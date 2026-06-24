@@ -4743,3 +4743,2107 @@ MISTAKE 10: "EventBridge Rule not routing correctly"
 ---
 
 *This implementation guide completes the end-to-end walkthrough. Combined with Part 1 (architecture and design), you now have everything needed to understand, build, deploy, and operate the Invoice Automation system from scratch.*
+
+---
+
+# Part 3 — Build the Entire System Using ONLY AWS (No External Tools Required)
+
+> **Scenario:** You have the sample PDF invoices in `test_data/`. You don't have Microsoft 365, you don't have GVP, you don't have any external service. You want to build this end-to-end using only AWS. This guide does exactly that.
+
+---
+
+## The AWS-Only Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│            AWS-ONLY INVOICE AUTOMATION — COMPLETE ARCHITECTURE           │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐│
+│  │  TWO WAYS TO GET INVOICES INTO THE SYSTEM (choose one)             ││
+│  │                                                                     ││
+│  │  OPTION A (Simplest — no email needed):                            ││
+│  │    You → aws s3 cp invoice.pdf s3://your-bucket/invoices/          ││
+│  │          (manually upload with one CLI command)                     ││
+│  │                                                                     ││
+│  │  OPTION B (Automated email receiving — requires a domain):         ││
+│  │    Carrier email → AWS SES → ses_email_handler Lambda              ││
+│  │    → extracts PDF from email → uploads to S3                       ││
+│  └─────────────────────────────────┬───────────────────────────────────┘│
+│                                    │ PDF lands in S3                    │
+│                                    │ (both options end here)            │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┿━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│
+│                                    │ S3 ObjectCreated → EventBridge     │
+│  STAGE 1: AI EXTRACTION            │                                    │
+│  ┌─────────────────────────────────▼───────────────────────────────────┐│
+│  │  bedrock_processor Lambda                                           ││
+│  │  → starts async Bedrock Data Automation job                        ││
+│  └─────────────────────────────────┬───────────────────────────────────┘│
+│                                    │                                    │
+│  ┌─────────────────────────────────▼───────────────────────────────────┐│
+│  │  AWS Bedrock Data Automation                                        ││
+│  │  → reads PDF → applies invoice blueprint → extracts 18 fields      ││
+│  │  → writes JSON to S3 → emits completion event                      ││
+│  └─────────────────────────────────┬───────────────────────────────────┘│
+│                                    │ Bedrock completion → EventBridge   │
+│  STAGE 2: SAVE RESULTS             │                                    │
+│  ┌─────────────────────────────────▼───────────────────────────────────┐│
+│  │  dynamodb_publisher Lambda                                          ││
+│  │  → reads extracted fields from S3                                  ││
+│  │  → saves all 18 fields to DynamoDB                                 ││
+│  │  → sends SNS success email: "Invoice INV-001 processed!"           ││
+│  └─────────────────────────────────┬───────────────────────────────────┘│
+│                                    │                                    │
+│  ┌─────────────────────────────────▼───────────────────────────────────┐│
+│  │  DynamoDB Table: invoice_records                                    ││
+│  │  → stores every processed invoice                                  ││
+│  │  → query from console or CLI                                       ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+│                                                                         │
+│  ERROR HANDLING:                                                        │
+│  Lambda failures → SQS DLQ → dlq_processor Lambda → SNS alert email   │
+│                                                                         │
+│  MONITORING:                                                            │
+│  CloudWatch Logs + Metrics + Dashboard + 3 Alarms                      │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### What You Need
+
+```
+✓ AWS account (free tier covers development)
+✓ AWS CLI installed and configured
+✓ Python 3.11 installed
+✓ Terraform installed
+✓ The sample PDFs from test_data/ folder
+✓ An email address (your own Gmail) to receive success/failure notifications
+
+That's it. No Microsoft. No Oracle. No external APIs.
+```
+
+### AWS Services Replacing External Ones
+
+| Original System (external) | AWS-Only Replacement |
+|---------------------------|---------------------|
+| Microsoft 365 + Graph API | AWS SES (email receiving) OR manual S3 upload |
+| MSAL OAuth library | Not needed — AWS IAM handles all auth |
+| GVP / Oracle database | Amazon DynamoDB |
+| GVP REST API | DynamoDB `put_item()` call |
+| Azure AD credentials | Not needed |
+
+---
+
+## The New Folder Structure
+
+```
+freight-audit-aws-only/
+│
+├── lambda_functions/
+│   ├── ses_email_handler/          ← NEW: receive emails via AWS SES (Option B)
+│   │   └── handler.py
+│   │
+│   ├── bedrock_invoice_processor/  ← SAME: starts Bedrock job
+│   │   └── handler.py
+│   │
+│   ├── dynamodb_publisher/         ← NEW: saves to DynamoDB (replaces GVP)
+│   │   └── handler.py
+│   │
+│   ├── bedrock_blueprint_manager/  ← SAME: one-time Bedrock setup
+│   │   ├── handler.py
+│   │   └── bedrock_invoice_blueprint.json
+│   │
+│   └── dlq_processor/             ← SAME: DLQ error alerts via SNS
+│       └── handler.py
+│
+└── terraform/
+    ├── versions.tf
+    ├── variables.tf
+    ├── locals.tf
+    ├── data.tf
+    ├── s3.tf                       ← S3 bucket + EventBridge notifications
+    ├── dynamodb.tf                 ← NEW: DynamoDB table for invoice records
+    ├── ses.tf                      ← NEW: SES email receiving (Option B)
+    ├── lambda.tf                   ← 4-5 Lambda functions
+    ├── eventbridge.tf              ← EventBridge rules
+    ├── sqs.tf                      ← DLQs
+    ├── sns.tf                      ← NEW: success + failure notifications
+    ├── iam.tf                      ← Lambda permissions
+    ├── cloudwatch.tf               ← Logs, metrics, alarms
+    └── environments/
+        └── dev.tfvars
+```
+
+---
+
+## OPTION A — Simplest Path: Upload PDFs Directly to S3
+
+If you want to test right now without setting up email at all, this is the path. You just run one CLI command to upload a PDF and the entire pipeline fires automatically.
+
+```bash
+# After deploying (Step 15 below), upload any sample PDF:
+aws s3 cp test_data/invoice.pdf s3://YOUR_BUCKET_NAME/invoices/invoice.pdf
+
+# That's it. Watch the pipeline:
+# S3 upload → EventBridge → Bedrock processor → Bedrock AI → DynamoDB publisher → DynamoDB
+
+# 8-13 minutes later, check DynamoDB:
+aws dynamodb scan --table-name invoice-records --output table
+```
+
+This is how you develop and test without needing any email setup.
+
+---
+
+## OPTION B — AWS SES Email Receiving (Automated Pipeline)
+
+SES (Simple Email Service) is AWS's email service. It can receive inbound emails and pass them to Lambda automatically.
+
+### How SES Email Receiving Works
+
+```
+Sender (carrier) → sends email to invoices@yourdomain.com
+          │
+          ▼
+AWS SES (acts as your email server)
+  - SES checks: does domain yourdomain.com belong to this AWS account? Yes.
+  - SES applies receipt rule: "for emails to invoices@*, invoke Lambda"
+          │
+          ▼
+ses_email_handler Lambda is called
+  - SES passes the full email as a base64-encoded string in the event
+  - Lambda decodes the email, finds PDF attachments, uploads to S3
+          │
+          ▼
+S3 ObjectCreated → EventBridge → Bedrock processor → (same as before)
+```
+
+### SES Domain Verification (required for Option B)
+
+You need a domain (e.g., `myfreightcompany.com`). If you bought one from Route 53 or GoDaddy:
+
+```bash
+# Step 1: Start domain verification in SES
+aws ses verify-domain-identity --domain yourdomain.com
+
+# SES gives you a TXT record to add to your DNS:
+# Name: _amazonses.yourdomain.com
+# Value: some-long-string-here
+
+# Step 2: Add the TXT record in your DNS provider (Route 53, GoDaddy, etc.)
+# Route 53 example:
+aws route53 change-resource-record-sets \
+    --hosted-zone-id YOUR_ZONE_ID \
+    --change-batch '{
+        "Changes": [{
+            "Action": "CREATE",
+            "ResourceRecordSet": {
+                "Name": "_amazonses.yourdomain.com",
+                "Type": "TXT",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "\"your-ses-verification-string\""}]
+            }
+        }]
+    }'
+
+# Step 3: Add MX record so email arrives at SES
+# (MX = Mail Exchanger — tells the internet to send email for your domain to SES)
+aws route53 change-resource-record-sets \
+    --hosted-zone-id YOUR_ZONE_ID \
+    --change-batch '{
+        "Changes": [{
+            "Action": "CREATE",
+            "ResourceRecordSet": {
+                "Name": "yourdomain.com",
+                "Type": "MX",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10 inbound-smtp.us-east-1.amazonaws.com"}]
+            }
+        }]
+    }'
+
+# Step 4: Wait for verification (5-10 minutes)
+aws ses get-domain-verification-attributes --domains yourdomain.com
+# Look for: "VerificationStatus": "Success"
+
+# If you don't have a domain: SES sandbox allows testing with VERIFIED email addresses
+# Just verify your own email: aws ses verify-email-identity --email-address your@email.com
+```
+
+---
+
+## Step A1 — Write the SES Email Handler Lambda (Option B)
+
+Create: `lambda_functions/ses_email_handler/handler.py`
+
+```python
+"""
+AWS SES Email Handler — receives invoice emails via SES and extracts PDF attachments.
+
+When SES receives an email to invoices@yourdomain.com:
+1. SES decodes the raw email
+2. Invokes this Lambda with the email content in the event
+3. Lambda parses the email, finds PDF attachments, uploads to S3
+
+This replaces Microsoft Graph API entirely — 100% AWS.
+"""
+
+import os
+import json
+import boto3
+import uuid
+import base64
+import re
+import time
+import email        # Python standard library for parsing email format (RFC 2822)
+from datetime import datetime
+from aws_lambda_powertools import Logger, Metrics
+from aws_lambda_powertools.metrics import MetricUnit
+
+logger  = Logger(service="ses_email_handler")
+metrics = Metrics(namespace="InvoiceAutomation")
+
+s3_client = boto3.client('s3')
+
+
+def sanitize_filename(filename):
+    """Remove unsafe characters from filename for S3 key."""
+    filename = filename.replace(' ', '_')
+    filename = re.sub(r'[^\w\-_\.]', '', filename)
+    return filename if filename else 'attachment.pdf'
+
+
+def sanitize_metadata_value(value):
+    """
+    Remove control characters from metadata values.
+    S3 metadata is stored as HTTP headers — headers cannot have newlines.
+    """
+    value_str = str(value)
+    value_str = value_str.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
+    value_str = ''.join(c if ord(c) >= 32 and ord(c) != 127 else ' ' for c in value_str)
+    return ' '.join(value_str.split())
+
+
+@logger.inject_lambda_context(log_event=False)  # log_event=False because raw email content is huge
+@metrics.log_metrics(capture_cold_start_metric=True)
+def lambda_handler(event, context):
+    """
+    Called by SES when an email arrives.
+    
+    SES event format:
+    {
+        "Records": [{
+            "eventSource": "aws:ses",
+            "ses": {
+                "mail": {
+                    "source": "carrier@bnsf.com",
+                    "destination": ["invoices@yourdomain.com"],
+                    "commonHeaders": {
+                        "subject": "BNSF Invoice #12345",
+                        "date": "Mon, 17 Dec 2025 14:30:22 +0000"
+                    }
+                },
+                "receipt": {
+                    "action": {
+                        "type": "Lambda",
+                        "invocationType": "Event"
+                    }
+                }
+            },
+            "content": "MIME-Version: 1.0\r\nFrom: ...\r\n..."   ← full raw email!
+        }]
+    }
+    """
+    
+    s3_bucket = os.getenv("S3_BUCKET")
+    s3_prefix = os.getenv("S3_PREFIX", "invoices/")
+    
+    processed_count = 0
+    pdf_count       = 0
+    errors          = []
+    
+    for record in event.get('Records', []):
+        
+        # Get email metadata from SES event
+        ses_data = record.get('ses', {})
+        mail     = ses_data.get('mail', {})
+        
+        sender      = mail.get('source', 'unknown@unknown.com')
+        destination = mail.get('destination', [])
+        headers     = mail.get('commonHeaders', {})
+        subject     = headers.get('subject', '(No Subject)')
+        date        = headers.get('date', '')
+        
+        # The RECIPIENT address (for routing — same "plus addressing" concept)
+        # Emails to invoices+clientcode@yourdomain.com → recipient_address tells us the client
+        recipient_address = destination[0] if destination else ''
+        
+        # The full raw email content (the 'content' field from SES)
+        # This is the complete RFC 2822 email as a string
+        raw_email_content = record.get('content', '')
+        
+        if not raw_email_content:
+            logger.warning("No email content in SES record")
+            continue
+        
+        # Parse the raw email using Python's built-in email library
+        # email.message_from_string() understands MIME format including attachments
+        parsed_email = email.message_from_string(raw_email_content)
+        
+        logger.info("Processing email", extra={
+            "sender": sender,
+            "subject": subject,
+            "recipient": recipient_address,
+        })
+        
+        # walk() iterates over ALL parts of the email:
+        # - Part 1: the text/plain body ("Please find attached invoice...")
+        # - Part 2: the text/html body (same but HTML formatted)  
+        # - Part 3: the PDF attachment (what we want)
+        for part in parsed_email.walk():
+            
+            content_type        = part.get_content_type()         # "application/pdf", "text/plain", etc.
+            content_disposition = part.get('Content-Disposition', '')  # "attachment; filename=invoice.pdf"
+            filename            = part.get_filename()              # "invoice.pdf" or None
+            
+            # We want ONLY PDF file attachments
+            # Skip: text/plain, text/html (email body)
+            # Skip: inline images (company logos)
+            # Keep: application/pdf with Content-Disposition = "attachment"
+            
+            is_pdf = content_type == 'application/pdf' or (filename and filename.lower().endswith('.pdf'))
+            is_attachment = 'attachment' in content_disposition.lower()
+            
+            if not (is_pdf and is_attachment):
+                continue
+            
+            # Found a PDF attachment! Get the bytes.
+            # get_payload(decode=True) automatically handles base64/quoted-printable decoding
+            # Returns raw bytes (not a string)
+            file_bytes = part.get_payload(decode=True)
+            
+            if not file_bytes:
+                logger.warning(f"Empty payload for attachment: {filename}")
+                continue
+            
+            try:
+                # Generate unique correlation ID for tracking
+                correlation_id = str(uuid.uuid4())
+                
+                # Build S3 key
+                timestamp    = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                safe_name    = sanitize_filename(filename or 'invoice.pdf')
+                s3_key       = f"{s3_prefix}{timestamp}_{safe_name}"
+                
+                # S3 metadata — all email context travels with the PDF
+                metadata = {
+                    'correlation-id':          sanitize_metadata_value(correlation_id),
+                    'email-sender':            sanitize_metadata_value(sender)[:100],
+                    'email-recipient':         sanitize_metadata_value(recipient_address)[:100],
+                    'email-subject':           sanitize_metadata_value(subject)[:200],
+                    'email-received-time':     sanitize_metadata_value(date)[:50],
+                    'original-filename':       sanitize_metadata_value(filename or 'invoice.pdf')[:200],
+                    'attachment-size':         str(len(file_bytes)),
+                    'upload-timestamp':        datetime.utcnow().isoformat(),
+                    'processing-status':       'pending',
+                    'source':                  'ses-email',
+                }
+                
+                # Upload PDF to S3
+                # This upload triggers the S3 → EventBridge → Bedrock processor chain
+                s3_client.put_object(
+                    Bucket=s3_bucket,
+                    Key=s3_key,
+                    Body=file_bytes,
+                    ContentType='application/pdf',
+                    Metadata=metadata,
+                )
+                
+                logger.info("PDF uploaded to S3", extra={
+                    "correlation_id": correlation_id,
+                    "s3_key": s3_key,
+                    "size_bytes": len(file_bytes),
+                    "sender": sender,
+                })
+                
+                metrics.add_metric(name="PDFsUploaded", unit=MetricUnit.Count, value=1)
+                pdf_count += 1
+                
+            except Exception as e:
+                error_msg = f"Failed to upload attachment '{filename}': {str(e)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+        
+        processed_count += 1
+    
+    logger.info("SES processing complete", extra={
+        "emails_processed": processed_count,
+        "pdfs_uploaded": pdf_count,
+        "errors": len(errors),
+    })
+    
+    metrics.add_metric(name="EmailsProcessed", unit=MetricUnit.Count, value=processed_count)
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'emails_processed': processed_count,
+            'pdfs_uploaded': pdf_count,
+        })
+    }
+```
+
+---
+
+## Step A2 — Bedrock Processor Lambda (Identical to Original)
+
+This is exactly the same as before — it doesn't know or care whether the PDF came from SES or was manually uploaded. Create `lambda_functions/bedrock_invoice_processor/handler.py` — use the code from Step 8 in Part 2. The only change is the environment variable for the Bedrock profile ARN.
+
+```python
+"""
+Starts a Bedrock Data Automation async job when a PDF lands in S3.
+100% identical to the original — no external dependencies.
+"""
+import os, json, boto3
+from urllib.parse import unquote_plus
+from aws_lambda_powertools import Logger, Metrics
+from aws_lambda_powertools.metrics import MetricUnit
+
+logger  = Logger(service="bedrock_invoice_processor")
+metrics = Metrics(namespace="InvoiceAutomation")
+
+s3_client          = boto3.client('s3')
+bda_client         = boto3.client('bedrock-data-automation')
+bda_runtime_client = boto3.client('bedrock-data-automation-runtime')
+
+@logger.inject_lambda_context(log_event=True)
+@metrics.log_metrics(capture_cold_start_metric=True)
+def lambda_handler(event, context):
+    
+    region     = os.environ.get('AWS_REGION', 'us-east-1')
+    account_id = context.invoked_function_arn.split(':')[4]
+    
+    s3_bucket = event["detail"]["bucket"]["name"]
+    s3_key    = unquote_plus(event["detail"]["object"]["key"])
+    
+    # Read correlation_id from S3 metadata (set when PDF was uploaded)
+    s3_meta        = s3_client.head_object(Bucket=s3_bucket, Key=s3_key).get('Metadata', {})
+    correlation_id = s3_meta.get('correlation-id', str(uuid.uuid4()))
+    
+    logger.append_keys(correlation_id=correlation_id)
+    logger.info("Starting Bedrock job", extra={"s3_key": s3_key})
+    
+    # Look up the Bedrock project ARN (created by blueprint_manager)
+    project_name = os.getenv("PROJECT_NAME", "Freight_Audit_Agent")
+    projects     = bda_client.list_data_automation_projects(projectStageFilter='LIVE')
+    project      = next((p for p in projects['projects'] if p['projectName'] == project_name), None)
+    
+    if not project:
+        raise ValueError(f"Bedrock project '{project_name}' not found — run blueprint_manager first")
+    
+    # Where Bedrock writes output
+    output_bucket = os.getenv("OUTPUT_BUCKET", s3_bucket)
+    output_prefix = os.getenv("OUTPUT_PREFIX", "bedrock-output/")
+    
+    # AWS-managed profile ARN (references the AI model Bedrock uses)
+    profile_arn = f"arn:aws:bedrock:{region}:{account_id}:data-automation-profile/us.data-automation-v1"
+    
+    # Start the async job
+    response = bda_runtime_client.invoke_data_automation_async(
+        inputConfiguration={'s3Uri': f's3://{s3_bucket}/{s3_key}'},
+        outputConfiguration={'s3Uri': f's3://{output_bucket}/{output_prefix}'},
+        dataAutomationProfileArn=profile_arn,
+        dataAutomationConfiguration={'dataAutomationProjectArn': project['projectArn']},
+        notificationConfiguration={'eventBridgeConfiguration': {'eventBridgeEnabled': True}},
+    )
+    
+    metrics.add_metric(name="BedrockJobsStarted", unit=MetricUnit.Count, value=1)
+    logger.info("Bedrock job started", extra={"invocation_arn": response['invocationArn']})
+    
+    return {'statusCode': 200, 'body': json.dumps({'invocation_arn': response['invocationArn']})}
+```
+
+---
+
+## Step A3 — DynamoDB Publisher Lambda — Every Line Explained
+
+This is the **key replacement** for GVP. Instead of posting to an external Oracle database via REST API, we save to DynamoDB — Amazon's fully managed NoSQL database. No REST API, no credentials, no external service. Just `table.put_item()`.
+
+Create: `lambda_functions/dynamodb_publisher/handler.py`
+
+```python
+"""
+Saves Bedrock-extracted invoice data to DynamoDB.
+Replaces the GVP API entirely — 100% AWS, no external dependencies.
+
+DynamoDB is Amazon's NoSQL database:
+- Fully managed (no servers to maintain)
+- Scales automatically
+- No schema required (you can store any fields)
+- Free tier: 25GB storage + 200 million requests/month
+- Cost at 1,000 invoices/month: essentially $0
+"""
+
+import os
+import json
+import boto3
+import uuid
+from datetime import datetime, timezone
+from urllib.parse import unquote_plus
+from decimal import Decimal   # DynamoDB requires Decimal for numbers, not float
+from aws_lambda_powertools import Logger, Metrics
+from aws_lambda_powertools.metrics import MetricUnit
+
+logger  = Logger(service="dynamodb_publisher")
+metrics = Metrics(namespace="InvoiceAutomation")
+
+s3_client  = boto3.client('s3')
+sns_client = boto3.client('sns')
+
+# DynamoDB resource (higher-level than client — easier to use)
+dynamodb   = boto3.resource('dynamodb')
+
+
+def read_json_from_s3_uri(s3_uri):
+    """
+    Read a JSON file from S3 given its full URI.
+    
+    s3_uri example: "s3://my-bucket/bedrock-output/JOB_123/job_metadata.json"
+    """
+    # Parse: "s3://bucket/key" → bucket="bucket", key="key"
+    without_prefix = s3_uri.replace("s3://", "")
+    parts  = without_prefix.split("/", 1)
+    bucket = parts[0]
+    key    = parts[1]
+    
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    content  = response['Body'].read().decode('utf-8')
+    return json.loads(content)
+
+
+def find_custom_output_uri(job_metadata_uri):
+    """
+    Navigate Bedrock's job_metadata.json to find the custom_output.json path.
+    
+    Bedrock output structure:
+    job_metadata.json:
+    {
+      "output_metadata": [{
+        "segment_metadata": [{
+          "custom_output_path": "s3://bucket/.../custom_output/0/custom_output.json"
+        }]
+      }]
+    }
+    """
+    metadata = read_json_from_s3_uri(job_metadata_uri)
+    
+    output_metadata  = metadata.get("output_metadata", [])
+    segment_metadata = output_metadata[0].get("segment_metadata", []) if output_metadata else []
+    custom_path      = segment_metadata[0].get("custom_output_path", "") if segment_metadata else ""
+    
+    if not custom_path:
+        raise ValueError(f"Could not find custom_output_path in {job_metadata_uri}")
+    
+    return custom_path
+
+
+def apply_business_rules(inference_results):
+    """
+    Apply field-level business rules to extracted data before saving.
+    
+    These clean up common AI extraction quirks.
+    """
+    cleaned = dict(inference_results)  # copy so we don't modify original
+    
+    # Rule 1: Remove currency symbols from FeeAmount
+    # AI sometimes returns "$45,335.98" even with clear instructions
+    fee = cleaned.get("FeeAmount", "")
+    if fee:
+        fee = fee.replace("$", "").replace(",", "").strip()
+        cleaned["FeeAmount"] = fee
+    
+    # Rule 2: Take first ServiceDate if multiple returned
+    service_date = cleaned.get("ServiceDate", "")
+    if service_date and "," in service_date:
+        cleaned["ServiceDate"] = service_date.split(",")[0].strip()
+    
+    # Rule 3: Truncate BOLNumber to 20 chars (DynamoDB doesn't need this,
+    # but it's good practice to match the original system's constraints)
+    bol = cleaned.get("BOLNumber", "")
+    if bol and len(bol) > 20:
+        cleaned["BOLNumber"] = bol[:20]
+    
+    return cleaned
+
+
+def convert_floats_to_decimal(obj):
+    """
+    DynamoDB does NOT accept Python float values — it requires Decimal.
+    
+    Why: DynamoDB stores numbers as exact-precision decimals.
+    Python floats have floating-point imprecision (0.1 + 0.2 = 0.30000000000000004).
+    Decimal avoids this.
+    
+    This function recursively converts all floats in a dict to Decimal.
+    """
+    if isinstance(obj, float):
+        return Decimal(str(obj))    # str() first to preserve precision
+    elif isinstance(obj, dict):
+        return {k: convert_floats_to_decimal(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_floats_to_decimal(item) for item in obj]
+    return obj
+
+
+@logger.inject_lambda_context(log_event=True)
+@metrics.log_metrics(capture_cold_start_metric=True)
+def lambda_handler(event, context):
+    """
+    Called when Bedrock finishes processing a PDF.
+    Reads extracted fields from S3 and saves them to DynamoDB.
+    
+    The Bedrock completion event:
+    {
+        "source": "aws.bedrock-data-automation-runtime",
+        "detail-type": "Data Automation Async Invocation Status Change",
+        "detail": {
+            "status": "SUCCEEDED",
+            "input_s3_object": {"s3_bucket": "...", "name": "invoices/...pdf"},
+            "output_s3_location": {"s3_bucket": "...", "name": "bedrock-output/JOB/"}
+        }
+    }
+    """
+    
+    table_name    = os.getenv("DYNAMODB_TABLE", "invoice-records")
+    sns_topic_arn = os.getenv("SNS_SUCCESS_TOPIC_ARN", "")  # optional success notifications
+    
+    # Get DynamoDB table reference
+    table = dynamodb.Table(table_name)
+    
+    # ── STEP 1: Parse Bedrock completion event ──
+    detail = event.get("detail", {})
+    status = detail.get("status", "UNKNOWN")
+    
+    # Only process SUCCEEDED jobs
+    # FAILED jobs will trigger Lambda failures → DLQ → alert email
+    if status != "SUCCEEDED":
+        logger.warning(f"Bedrock job status: {status} — skipping")
+        return {'statusCode': 200, 'body': json.dumps({'skipped': True})}
+    
+    input_obj    = detail.get("input_s3_object", {})
+    output_loc   = detail.get("output_s3_location", {})
+    
+    input_bucket  = input_obj.get("s3_bucket", "")
+    input_key     = unquote_plus(input_obj.get("name", ""))
+    output_bucket = output_loc.get("s3_bucket", "")
+    output_key    = unquote_plus(output_loc.get("name", ""))
+    
+    # ── STEP 2: Get metadata from original PDF (uploaded to S3) ──
+    # This has correlation_id, email sender, subject, etc.
+    s3_meta        = s3_client.head_object(Bucket=input_bucket, Key=input_key).get('Metadata', {})
+    correlation_id = s3_meta.get('correlation-id', str(uuid.uuid4()))
+    
+    logger.append_keys(correlation_id=correlation_id)
+    
+    # ── STEP 3: Find and read Bedrock extracted data ──
+    # job_metadata.json is at the root of the output location
+    job_metadata_uri  = f"s3://{output_bucket}/{output_key}job_metadata.json"
+    custom_output_uri = find_custom_output_uri(job_metadata_uri)
+    
+    # Read the actual extracted invoice fields
+    result_json       = read_json_from_s3_uri(custom_output_uri)
+    inference_results = result_json.get("inference_result", {})
+    
+    logger.info("Bedrock extraction complete", extra={
+        "invoice_number": inference_results.get("InvoiceNumber", "unknown"),
+        "carrier":        inference_results.get("Carrier", "unknown"),
+        "fields_found":   len([v for v in inference_results.values() if v]),
+    })
+    
+    # ── STEP 4: Apply business rules ──
+    cleaned_fields = apply_business_rules(inference_results)
+    
+    # ── STEP 5: Build the DynamoDB item ──
+    # DynamoDB stores key-value pairs — any structure you want
+    # We store all 18 invoice fields PLUS metadata about the processing
+    now = datetime.now(timezone.utc)
+    
+    # Primary key: invoice_id (partition key) — unique per invoice
+    # Sort key: processed_at — when we processed it (for time-series queries)
+    item = {
+        # Keys
+        'invoice_id':       correlation_id,     # unique ID (UUID)
+        'processed_at':     now.isoformat(),    # ISO 8601 timestamp
+        
+        # Invoice fields extracted by Bedrock AI (all 18 fields)
+        'InvoiceNumber':    cleaned_fields.get('InvoiceNumber', ''),
+        'InvoiceDate':      cleaned_fields.get('InvoiceDate', ''),
+        'ServiceDate':      cleaned_fields.get('ServiceDate', ''),
+        'Carrier':          cleaned_fields.get('Carrier', ''),
+        'FeeAmount':        cleaned_fields.get('FeeAmount', ''),
+        'Currency':         cleaned_fields.get('Currency', 'USD'),
+        'PartyName':        cleaned_fields.get('PartyName', ''),
+        'OriginCity':       cleaned_fields.get('OriginCity', ''),
+        'OriginState':      cleaned_fields.get('OriginState', ''),
+        'DestinationCity':  cleaned_fields.get('DestinationCity', ''),
+        'DestinationState': cleaned_fields.get('DestinationState', ''),
+        'BOLNumber':        cleaned_fields.get('BOLNumber', ''),
+        'STCC':             cleaned_fields.get('STCC', ''),
+        'FleetID':          cleaned_fields.get('FleetID', ''),
+        'GLAccount':        cleaned_fields.get('GLAccount', ''),
+        'CostCenter':       cleaned_fields.get('CostCenter', ''),
+        'LeadEquipmentID':  cleaned_fields.get('LeadEquipmentID', ''),
+        'Comments':         cleaned_fields.get('Comments', ''),
+        
+        # Metadata about processing
+        'correlation_id':   correlation_id,
+        'pdf_s3_uri':       f"s3://{input_bucket}/{input_key}",    # link to original PDF
+        'bedrock_output_uri': custom_output_uri,                    # link to AI output
+        'email_sender':     s3_meta.get('email-sender', ''),
+        'email_subject':    s3_meta.get('email-subject', ''),
+        'email_received_at': s3_meta.get('email-received-time', ''),
+        'original_filename': s3_meta.get('original-filename', ''),
+        'source':           s3_meta.get('source', 'direct-upload'),
+        'processing_status': 'completed',
+    }
+    
+    # Remove empty string values
+    # DynamoDB accepts None (omit), but not empty strings in some contexts
+    item = {k: v for k, v in item.items() if v != ''}
+    
+    # Convert any floats to Decimal (DynamoDB requirement)
+    item = convert_floats_to_decimal(item)
+    
+    # ── STEP 6: Save to DynamoDB ──
+    # put_item: creates or REPLACES item with same key
+    # If same invoice processed twice (duplicate), it overwrites with same data
+    # → Naturally idempotent (safe to run multiple times)
+    table.put_item(Item=item)
+    
+    invoice_number = cleaned_fields.get('InvoiceNumber', 'unknown')
+    carrier        = cleaned_fields.get('Carrier', 'unknown')
+    fee_amount     = cleaned_fields.get('FeeAmount', 'unknown')
+    
+    logger.info("Invoice saved to DynamoDB", extra={
+        "invoice_number": invoice_number,
+        "carrier":        carrier,
+        "fee_amount":     fee_amount,
+        "table":          table_name,
+    })
+    
+    # ── STEP 7: Send success notification email (optional) ──
+    # SNS will email you when each invoice is successfully processed
+    if sns_topic_arn:
+        try:
+            sns_client.publish(
+                TopicArn=sns_topic_arn,
+                Subject=f"Invoice Processed: {invoice_number} from {carrier}",
+                Message=(
+                    f"Invoice successfully processed and saved to DynamoDB.\n\n"
+                    f"Invoice Number: {invoice_number}\n"
+                    f"Carrier:        {carrier}\n"
+                    f"Amount:         {fee_amount} {cleaned_fields.get('Currency', 'USD')}\n"
+                    f"Origin:         {cleaned_fields.get('OriginCity', '')} {cleaned_fields.get('OriginState', '')}\n"
+                    f"Destination:    {cleaned_fields.get('DestinationCity', '')} {cleaned_fields.get('DestinationState', '')}\n"
+                    f"Service Date:   {cleaned_fields.get('ServiceDate', '')}\n\n"
+                    f"Correlation ID: {correlation_id}\n"
+                    f"PDF Location:   s3://{input_bucket}/{input_key}\n\n"
+                    f"View in DynamoDB:\n"
+                    f"aws dynamodb get-item --table-name {table_name} "
+                    f"--key '{{\"invoice_id\": {{\"S\": \"{correlation_id}\"}}}}'"
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Could not send success notification: {e}")
+    
+    metrics.add_metric(name="InvoicesSaved", unit=MetricUnit.Count, value=1)
+    
+    # Calculate end-to-end time if we have when the email was received
+    email_received = s3_meta.get('email-received-time', '')
+    if email_received:
+        try:
+            from datetime import datetime, timezone
+            received_dt = datetime.fromisoformat(email_received.replace('Z', '+00:00'))
+            elapsed_sec = (now - received_dt).total_seconds()
+            elapsed_min = round(elapsed_sec / 60, 1)
+            logger.info(f"End-to-end time: {elapsed_min} minutes")
+            metrics.add_metric(name="EndToEndLatency", unit=MetricUnit.Milliseconds, value=int(elapsed_sec * 1000))
+        except Exception:
+            pass
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'invoice_number': invoice_number,
+            'carrier':        carrier,
+            'correlation_id': correlation_id,
+            'table':          table_name,
+        })
+    }
+```
+
+---
+
+## Step A4 — Write All Terraform Files for AWS-Only System
+
+### terraform/dynamodb.tf — The Invoice Database
+
+```hcl
+# terraform/dynamodb.tf
+
+# DynamoDB table to store all processed invoices
+# Think of this as a spreadsheet where each row is one invoice
+resource "aws_dynamodb_table" "invoice_records" {
+  name         = "${var.environment}-invoice-records"
+  billing_mode = "PAY_PER_REQUEST"   # No provisioned capacity needed — pay per read/write
+                                     # Free tier: 25 GB storage + 25 read/write units/month
+  
+  # Primary key: invoice_id (each invoice has a unique UUID)
+  # hash_key = "partition key" in DynamoDB = the main lookup key
+  hash_key = "invoice_id"
+  
+  # Sort key: processed_at (timestamp when we saved it)
+  # range_key = "sort key" = secondary ordering within a partition
+  # Together: you can query "all invoices with invoice_id=X sorted by time"
+  range_key = "processed_at"
+  
+  # Define only the key attributes here (not all 18 invoice fields)
+  # DynamoDB is schemaless — non-key attributes don't need declaration
+  attribute {
+    name = "invoice_id"
+    type = "S"   # S = String (UUID like "a3f8c921-4d2b-...")
+  }
+  
+  attribute {
+    name = "processed_at"
+    type = "S"   # S = String (ISO timestamp like "2025-12-17T14:30:22.123456+00:00")
+  }
+  
+  # Global Secondary Index: allows querying by Carrier
+  # Without this: you can only find invoices by invoice_id
+  # With this: you can find "all invoices from BNSF carrier" efficiently
+  global_secondary_index {
+    name            = "CarrierIndex"
+    hash_key        = "Carrier"        # Look up by carrier name
+    range_key       = "processed_at"   # Sort by time within carrier
+    projection_type = "ALL"            # Include all fields in results
+  }
+  
+  # Need to declare GSI attributes here
+  attribute {
+    name = "Carrier"
+    type = "S"
+  }
+  
+  # Enable DynamoDB Streams (optional — can trigger Lambda on changes)
+  stream_enabled   = true
+  stream_view_type = "NEW_IMAGE"   # stream shows new item value after each write
+  
+  # Encryption at rest (free, always recommended)
+  server_side_encryption {
+    enabled = true
+  }
+  
+  # Automatic backups
+  point_in_time_recovery {
+    enabled = true   # allows restoring to any point in last 35 days
+  }
+  
+  # Delete old invoices after 1 year (saves storage costs)
+  # TTL = Time To Live — DynamoDB automatically deletes expired items
+  # Items need a "ttl" attribute with Unix timestamp (seconds since 1970)
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+  
+  tags = merge(local.common_tags, {
+    Name        = "${var.environment}-invoice-records"
+    Description = "Stores all processed freight invoice records"
+  })
+}
+```
+
+### terraform/sns.tf — Success + Failure Email Notifications
+
+```hcl
+# terraform/sns.tf
+
+# SUCCESS topic: email when invoice is processed successfully
+resource "aws_sns_topic" "invoice_success" {
+  name = "${local.name_prefix}-invoice-success"
+  
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-invoice-success"
+  })
+}
+
+# Email subscription for success notifications
+resource "aws_sns_topic_subscription" "invoice_success_email" {
+  count     = var.alert_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.invoice_success.arn
+  protocol  = "email"
+  endpoint  = var.alert_email   # Your email address — you'll confirm via email link
+}
+
+# FAILURE topic: email when something goes wrong (DLQ alerts)
+resource "aws_sns_topic" "invoice_errors" {
+  name = "${local.name_prefix}-invoice-errors"
+  
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-invoice-errors"
+  })
+}
+
+resource "aws_sns_topic_subscription" "invoice_errors_email" {
+  count     = var.alert_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.invoice_errors.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# Output ARNs for Lambda environment variables
+output "sns_success_topic_arn" {
+  value = aws_sns_topic.invoice_success.arn
+}
+
+output "sns_errors_topic_arn" {
+  value = aws_sns_topic.invoice_errors.arn
+}
+```
+
+### terraform/ses.tf — Email Receiving (Option B Only)
+
+```hcl
+# terraform/ses.tf
+# Only needed for Option B (email receiving via SES)
+# Skip this file entirely if using Option A (direct S3 upload)
+
+# Grant SES permission to write raw emails to S3
+resource "aws_s3_bucket_policy" "ses_email_storage" {
+  count  = var.enable_ses_email_receiving ? 1 : 0
+  bucket = local.s3_bucket_name
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowSESPutObject"
+        Effect    = "Allow"
+        Principal = { Service = "ses.amazonaws.com" }
+        Action    = "s3:PutObject"
+        Resource  = "${local.s3_bucket_arn}/ses-raw-emails/*"
+        Condition = {
+          StringEquals = { "aws:Referer" = data.aws_caller_identity.current.account_id }
+        }
+      }
+    ]
+  })
+}
+
+# SES receipt rule set (the container for all rules)
+resource "aws_ses_receipt_rule_set" "main" {
+  count        = var.enable_ses_email_receiving ? 1 : 0
+  rule_set_name = "${local.name_prefix}-receipt-rules"
+}
+
+# Mark this rule set as active
+resource "aws_ses_active_receipt_rule_set" "main" {
+  count        = var.enable_ses_email_receiving ? 1 : 0
+  rule_set_name = aws_ses_receipt_rule_set.main[0].rule_set_name
+}
+
+# Receipt rule: for all emails to invoices@yourdomain.com → invoke Lambda
+resource "aws_ses_receipt_rule" "invoice_handler" {
+  count         = var.enable_ses_email_receiving ? 1 : 0
+  name          = "${local.name_prefix}-invoice-handler"
+  rule_set_name = aws_ses_receipt_rule_set.main[0].rule_set_name
+  
+  # Which email addresses this rule applies to
+  # Empty list = applies to ALL addresses in your verified domain
+  recipients = var.ses_recipient_addresses
+  
+  enabled      = true
+  scan_enabled = true   # Enable spam/virus scanning
+  
+  # Action: invoke Lambda when email arrives
+  lambda_action {
+    function_arn    = aws_lambda_function.ses_email_handler[0].arn
+    invocation_type = "Event"   # async — SES doesn't wait for Lambda response
+    position        = 1         # order within the rule (1 = first)
+  }
+}
+
+# Permission for SES to invoke Lambda
+resource "aws_lambda_permission" "ses_invoke" {
+  count         = var.enable_ses_email_receiving ? 1 : 0
+  statement_id  = "AllowSESInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ses_email_handler[0].function_name
+  principal     = "ses.amazonaws.com"
+  source_account = data.aws_caller_identity.current.account_id
+}
+```
+
+### terraform/lambda.tf — All Lambda Functions
+
+```hcl
+# terraform/lambda.tf (AWS-only version)
+
+# ── Helper: zip Lambda code for deployment ──
+# Terraform's archive_file reads your Python files and creates a .zip
+# Lambda requires code to be uploaded as a zip file
+
+data "archive_file" "bedrock_processor" {
+  type        = "zip"
+  source_dir  = "${path.module}/../lambda_functions/bedrock_invoice_processor"
+  output_path = "/tmp/bedrock_processor.zip"
+}
+
+data "archive_file" "dynamodb_publisher" {
+  type        = "zip"
+  source_dir  = "${path.module}/../lambda_functions/dynamodb_publisher"
+  output_path = "/tmp/dynamodb_publisher.zip"
+}
+
+data "archive_file" "blueprint_manager" {
+  type        = "zip"
+  source_dir  = "${path.module}/../lambda_functions/bedrock_blueprint_manager"
+  output_path = "/tmp/blueprint_manager.zip"
+}
+
+data "archive_file" "dlq_processor" {
+  type        = "zip"
+  source_dir  = "${path.module}/../lambda_functions/dlq_processor"
+  output_path = "/tmp/dlq_processor.zip"
+}
+
+# ── Lambda Layer: aws-lambda-powertools ──
+# Lambda only comes with boto3 by default
+# aws-lambda-powertools (for structured logging/metrics) must be added as a Layer
+# AWS publishes an official managed Layer — we use their ARN directly
+locals {
+  # Find the latest Powertools layer ARN for your region from:
+  # https://docs.powertools.aws.dev/lambda/python/latest/#lambda-layer
+  powertools_layer_arn = "arn:aws:lambda:${var.aws_region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python311-x86_64:4"
+}
+
+# ── Lambda 1: Bedrock Invoice Processor ──
+resource "aws_lambda_function" "bedrock_processor" {
+  filename         = data.archive_file.bedrock_processor.output_path
+  source_code_hash = data.archive_file.bedrock_processor.output_base64sha256
+  
+  function_name = "${local.name_prefix}-bedrock-processor"
+  role          = aws_iam_role.bedrock_processor_role.arn
+  handler       = "handler.lambda_handler"    # filename.function_name
+  runtime       = "python3.11"
+  timeout       = 300   # 5 minutes
+  memory_size   = 512
+  
+  layers = [local.powertools_layer_arn]
+  
+  environment {
+    variables = {
+      PROJECT_NAME               = var.bedrock_project_name
+      OUTPUT_BUCKET              = local.s3_bucket_name
+      OUTPUT_PREFIX              = "bedrock-output/"
+      POWERTOOLS_SERVICE_NAME    = "bedrock_invoice_processor"
+      POWERTOOLS_METRICS_NAMESPACE = "InvoiceAutomation"
+      LOG_LEVEL                  = "INFO"
+    }
+  }
+  
+  tags = local.common_tags
+}
+
+# ── Lambda 2: DynamoDB Publisher ──
+resource "aws_lambda_function" "dynamodb_publisher" {
+  filename         = data.archive_file.dynamodb_publisher.output_path
+  source_code_hash = data.archive_file.dynamodb_publisher.output_base64sha256
+  
+  function_name = "${local.name_prefix}-dynamodb-publisher"
+  role          = aws_iam_role.dynamodb_publisher_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 300
+  memory_size   = 512
+  
+  layers = [local.powertools_layer_arn]
+  
+  environment {
+    variables = {
+      DYNAMODB_TABLE             = aws_dynamodb_table.invoice_records.name
+      SNS_SUCCESS_TOPIC_ARN      = aws_sns_topic.invoice_success.arn
+      POWERTOOLS_SERVICE_NAME    = "dynamodb_publisher"
+      POWERTOOLS_METRICS_NAMESPACE = "InvoiceAutomation"
+      LOG_LEVEL                  = "INFO"
+    }
+  }
+  
+  tags = local.common_tags
+}
+
+# ── Lambda 3: Blueprint Manager (one-time setup) ──
+resource "aws_lambda_function" "blueprint_manager" {
+  filename         = data.archive_file.blueprint_manager.output_path
+  source_code_hash = data.archive_file.blueprint_manager.output_base64sha256
+  
+  function_name = "${local.name_prefix}-blueprint-manager"
+  role          = aws_iam_role.blueprint_manager_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 300
+  memory_size   = 256
+  
+  layers = [local.powertools_layer_arn]
+  
+  environment {
+    variables = {
+      BLUEPRINT_NAME = "freight-invoice-blueprint"
+      BLUEPRINT_FILE = "bedrock_invoice_blueprint.json"
+      PROJECT_NAME   = var.bedrock_project_name
+      LOG_LEVEL      = "INFO"
+    }
+  }
+  
+  tags = local.common_tags
+}
+
+# ── Lambda 4: DLQ Processor ──
+resource "aws_lambda_function" "dlq_processor" {
+  filename         = data.archive_file.dlq_processor.output_path
+  source_code_hash = data.archive_file.dlq_processor.output_base64sha256
+  
+  function_name = "${local.name_prefix}-dlq-processor"
+  role          = aws_iam_role.dlq_processor_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 60     # DLQ processing should be quick
+  memory_size   = 256
+  
+  layers = [local.powertools_layer_arn]
+  
+  environment {
+    variables = {
+      SNS_INVOICE_ERROR_TOPIC_ARN  = aws_sns_topic.invoice_errors.arn
+      POWERTOOLS_SERVICE_NAME      = "dlq_processor"
+      POWERTOOLS_METRICS_NAMESPACE = "InvoiceAutomation"
+      LOG_LEVEL                    = "INFO"
+    }
+  }
+  
+  tags = local.common_tags
+}
+
+# ── EventBridge permissions to invoke Lambda ──
+resource "aws_lambda_permission" "bedrock_processor_eventbridge" {
+  statement_id  = "AllowEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.bedrock_processor.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.s3_to_processor.arn
+}
+
+resource "aws_lambda_permission" "dynamodb_publisher_eventbridge" {
+  statement_id  = "AllowEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.dynamodb_publisher.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.bedrock_to_publisher.arn
+}
+
+# ── DLQ async invoke config ──
+resource "aws_lambda_function_event_invoke_config" "bedrock_processor" {
+  function_name                = aws_lambda_function.bedrock_processor.function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 3600
+  destination_config {
+    on_failure { destination = aws_sqs_queue.bedrock_processor_dlq.arn }
+  }
+}
+
+resource "aws_lambda_function_event_invoke_config" "dynamodb_publisher" {
+  function_name                = aws_lambda_function.dynamodb_publisher.function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 3600
+  destination_config {
+    on_failure { destination = aws_sqs_queue.dynamodb_publisher_dlq.arn }
+  }
+}
+```
+
+### terraform/iam.tf — Permissions (Least Privilege)
+
+```hcl
+# terraform/iam.tf (AWS-only version, simplified)
+
+# ── Bedrock Processor IAM Role ──
+resource "aws_iam_role" "bedrock_processor_role" {
+  name = "${local.name_prefix}-bedrock-processor-role"
+  
+  # "Trust policy" = who is allowed to assume (use) this role
+  # Only Lambda service can use this role
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "bedrock_processor_permissions" {
+  name = "permissions"
+  role = aws_iam_role.bedrock_processor_role.id
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      # Can write its own CloudWatch logs
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:aws:logs:*:*:log-group:/aws/lambda/${local.name_prefix}-bedrock-processor:*"
+      },
+      # Can write CloudWatch metrics
+      { Effect = "Allow", Action = "cloudwatch:PutMetricData", Resource = "*" },
+      # Can read PDFs from S3 (to tell Bedrock where they are)
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:HeadObject"]
+        Resource = "${local.s3_bucket_arn}/invoices/*"
+      },
+      # Can list and start Bedrock jobs
+      {
+        Effect   = "Allow"
+        Action   = [
+          "bedrock-data-automation:ListDataAutomationProjects",
+          "bedrock-data-automation-runtime:InvokeDataAutomationAsync",
+          "bedrock-data-automation-runtime:GetDataAutomationStatus"
+        ]
+        Resource = "*"
+      },
+      # Can send to its DLQ on failure
+      {
+        Effect   = "Allow"
+        Action   = "sqs:SendMessage"
+        Resource = aws_sqs_queue.bedrock_processor_dlq.arn
+      }
+    ]
+  })
+}
+
+# ── DynamoDB Publisher IAM Role ──
+resource "aws_iam_role" "dynamodb_publisher_role" {
+  name = "${local.name_prefix}-dynamodb-publisher-role"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "dynamodb_publisher_permissions" {
+  name = "permissions"
+  role = aws_iam_role.dynamodb_publisher_role.id
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+        Resource = "arn:aws:logs:*:*:log-group:/aws/lambda/${local.name_prefix}-dynamodb-publisher:*" },
+      { Effect = "Allow", Action = "cloudwatch:PutMetricData", Resource = "*" },
+      # Can read PDF metadata and Bedrock output from S3
+      { Effect = "Allow", Action = ["s3:GetObject", "s3:HeadObject"], Resource = "${local.s3_bucket_arn}/*" },
+      # Can write to DynamoDB invoice table ONLY (not any other table)
+      { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem"],
+        Resource = aws_dynamodb_table.invoice_records.arn },
+      # Can send success notifications via SNS
+      { Effect = "Allow", Action = "sns:Publish", Resource = aws_sns_topic.invoice_success.arn },
+      { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.dynamodb_publisher_dlq.arn }
+    ]
+  })
+}
+
+# ── Blueprint Manager IAM Role ──
+resource "aws_iam_role" "blueprint_manager_role" {
+  name = "${local.name_prefix}-blueprint-manager-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{ Action = "sts:AssumeRole", Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }}]
+  })
+}
+
+resource "aws_iam_role_policy" "blueprint_manager_permissions" {
+  name = "permissions"
+  role = aws_iam_role.blueprint_manager_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+        Resource = "arn:aws:logs:*:*:log-group:/aws/lambda/${local.name_prefix}-blueprint-manager:*" },
+      { Effect = "Allow", Action = [
+          "bedrock-data-automation:CreateBlueprint",
+          "bedrock-data-automation:UpdateBlueprint",
+          "bedrock-data-automation:ListBlueprints",
+          "bedrock-data-automation:CreateDataAutomationProject",
+          "bedrock-data-automation:ListDataAutomationProjects"
+        ], Resource = "*" }
+    ]
+  })
+}
+
+# ── DLQ Processor IAM Role ──
+resource "aws_iam_role" "dlq_processor_role" {
+  name = "${local.name_prefix}-dlq-processor-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{ Action = "sts:AssumeRole", Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }}]
+  })
+}
+
+resource "aws_iam_role_policy" "dlq_processor_permissions" {
+  name = "permissions"
+  role = aws_iam_role.dlq_processor_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+        Resource = "arn:aws:logs:*:*:log-group:/aws/lambda/${local.name_prefix}-dlq-processor:*" },
+      { Effect = "Allow", Action = ["s3:HeadObject"], Resource = "${local.s3_bucket_arn}/*" },
+      { Effect = "Allow", Action = "sns:Publish", Resource = aws_sns_topic.invoice_errors.arn },
+      { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+        Resource = [aws_sqs_queue.bedrock_processor_dlq.arn, aws_sqs_queue.dynamodb_publisher_dlq.arn] }
+    ]
+  })
+}
+```
+
+### terraform/eventbridge.tf — Route Events Between Services
+
+```hcl
+# terraform/eventbridge.tf (AWS-only version)
+
+# ── Rule 1: S3 PDF upload → Bedrock Processor ──
+resource "aws_cloudwatch_event_rule" "s3_to_processor" {
+  name        = "${local.name_prefix}-s3-to-processor"
+  description = "Trigger Bedrock processor when PDF is uploaded to S3"
+  
+  event_pattern = jsonencode({
+    source      = ["aws.s3"]
+    detail-type = ["Object Created"]
+    detail = {
+      bucket = { name = [local.s3_bucket_name] }
+      object = { key = [{ prefix = "invoices/" }] }   # only process files in invoices/ folder
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "s3_to_processor" {
+  rule      = aws_cloudwatch_event_rule.s3_to_processor.name
+  target_id = "BedrockProcessor"
+  arn       = aws_lambda_function.bedrock_processor.arn
+  
+  retry_policy {
+    maximum_retry_attempts       = 1      # try twice total before DLQ
+    maximum_event_age_in_seconds = 900    # give up after 15 min
+  }
+  
+  dead_letter_config {
+    arn = aws_sqs_queue.bedrock_processor_dlq.arn
+  }
+}
+
+# ── Rule 2: Bedrock completion → DynamoDB Publisher ──
+resource "aws_cloudwatch_event_rule" "bedrock_to_publisher" {
+  name        = "${local.name_prefix}-bedrock-to-publisher"
+  description = "Trigger DynamoDB publisher when Bedrock extraction completes"
+  
+  event_pattern = jsonencode({
+    source      = ["aws.bedrock-data-automation-runtime"]
+    detail-type = ["Data Automation Async Invocation Status Change"]
+    detail      = { status = ["SUCCEEDED"] }   # only process successful jobs
+  })
+}
+
+resource "aws_cloudwatch_event_target" "bedrock_to_publisher" {
+  rule      = aws_cloudwatch_event_rule.bedrock_to_publisher.name
+  target_id = "DynamoDBPublisher"
+  arn       = aws_lambda_function.dynamodb_publisher.arn
+  
+  retry_policy {
+    maximum_retry_attempts       = 1
+    maximum_event_age_in_seconds = 900
+  }
+  
+  dead_letter_config {
+    arn = aws_sqs_queue.dynamodb_publisher_dlq.arn
+  }
+}
+```
+
+### terraform/sqs.tf — Dead Letter Queues
+
+```hcl
+# terraform/sqs.tf (AWS-only, simplified)
+
+resource "aws_sqs_queue" "bedrock_processor_dlq" {
+  name                      = "${local.name_prefix}-bedrock-processor-dlq"
+  message_retention_seconds = 1209600   # 14 days
+  sqs_managed_sse_enabled   = true
+  tags = local.common_tags
+}
+
+resource "aws_sqs_queue" "dynamodb_publisher_dlq" {
+  name                      = "${local.name_prefix}-dynamodb-publisher-dlq"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+  tags = local.common_tags
+}
+
+# Allow EventBridge to write to DLQs when it can't deliver to Lambda
+resource "aws_sqs_queue_policy" "bedrock_processor_dlq" {
+  queue_url = aws_sqs_queue.bedrock_processor_dlq.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = ["events.amazonaws.com", "lambda.amazonaws.com"] }
+      Action    = "sqs:SendMessage"
+      Resource  = aws_sqs_queue.bedrock_processor_dlq.arn
+    }]
+  })
+}
+
+resource "aws_sqs_queue_policy" "dynamodb_publisher_dlq" {
+  queue_url = aws_sqs_queue.dynamodb_publisher_dlq.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = ["events.amazonaws.com", "lambda.amazonaws.com"] }
+      Action    = "sqs:SendMessage"
+      Resource  = aws_sqs_queue.dynamodb_publisher_dlq.arn
+    }]
+  })
+}
+
+# SQS triggers DLQ Processor Lambda when messages arrive
+resource "aws_lambda_event_source_mapping" "bedrock_processor_dlq" {
+  event_source_arn = aws_sqs_queue.bedrock_processor_dlq.arn
+  function_name    = aws_lambda_function.dlq_processor.arn
+  batch_size       = 1
+  enabled          = true
+}
+
+resource "aws_lambda_event_source_mapping" "dynamodb_publisher_dlq" {
+  event_source_arn = aws_sqs_queue.dynamodb_publisher_dlq.arn
+  function_name    = aws_lambda_function.dlq_processor.arn
+  batch_size       = 1
+  enabled          = true
+}
+```
+
+### terraform/variables.tf — Simplified Variables (No Azure, No GVP)
+
+```hcl
+# terraform/variables.tf (AWS-only version)
+
+variable "environment" {
+  type = string
+}
+
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "project_name" {
+  type    = string
+  default = "invoice-automation"
+}
+
+variable "bedrock_project_name" {
+  type    = string
+  default = "Freight_Audit_Agent"
+}
+
+variable "alert_email" {
+  description = "Your email address for success + failure notifications"
+  type        = string
+  default     = ""
+  # Set via: export TF_VAR_alert_email="your@email.com"
+}
+
+# Option B: SES email receiving
+variable "enable_ses_email_receiving" {
+  description = "Enable SES email receiving (requires verified domain)"
+  type        = bool
+  default     = false    # Default false — use Option A (direct S3 upload)
+}
+
+variable "ses_recipient_addresses" {
+  description = "Email addresses SES should receive (empty = all addresses for domain)"
+  type        = list(string)
+  default     = []
+}
+
+variable "invoice_domain" {
+  description = "Domain for receiving invoice emails (e.g., yourdomain.com)"
+  type        = string
+  default     = ""
+}
+```
+
+### terraform/environments/dev.tfvars — Your Config Values
+
+```hcl
+# terraform/environments/dev.tfvars
+
+environment  = "dev"
+aws_region   = "us-east-1"
+project_name = "invoice-automation"
+
+bedrock_project_name = "Freight_Audit_Agent"
+
+# Set to true only if you set up SES domain (Option B)
+enable_ses_email_receiving = false
+
+# Secrets — set these as TF_VAR_* env vars, NOT here
+# export TF_VAR_alert_email="your@email.com"
+```
+
+### terraform/locals.tf
+
+```hcl
+# terraform/locals.tf
+
+locals {
+  name_prefix = "${var.environment}-${var.project_name}"
+  
+  common_tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+  
+  # S3 bucket name — unique because it includes your AWS account ID
+  s3_bucket_name = "${local.name_prefix}-${data.aws_caller_identity.current.account_id}"
+  s3_bucket_arn  = aws_s3_bucket.main.arn
+}
+```
+
+### terraform/data.tf
+
+```hcl
+# terraform/data.tf
+
+# Get current AWS account and region info dynamically
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+```
+
+### terraform/s3.tf — S3 Bucket + EventBridge Notifications
+
+```hcl
+# terraform/s3.tf
+
+resource "aws_s3_bucket" "main" {
+  bucket = local.s3_bucket_name
+  tags   = local.common_tags
+}
+
+# Encryption: all files stored encrypted
+resource "aws_s3_bucket_server_side_encryption_configuration" "main" {
+  bucket = aws_s3_bucket.main.id
+  rule {
+    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
+  }
+}
+
+# Block all public access (invoices are private!)
+resource "aws_s3_bucket_public_access_block" "main" {
+  bucket                  = aws_s3_bucket.main.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# CRITICAL: Enable EventBridge notifications
+# Without this line, S3 uploads don't trigger EventBridge → Bedrock never runs!
+resource "aws_s3_bucket_notification" "main" {
+  bucket      = aws_s3_bucket.main.id
+  eventbridge = true    # ← this single setting enables the entire S3→EventBridge→Lambda chain
+}
+
+# Allow Bedrock to read PDFs and write output
+resource "aws_s3_bucket_policy" "main" {
+  bucket = aws_s3_bucket.main.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "BedrockRead"
+        Effect    = "Allow"
+        Principal = { Service = "bedrock.amazonaws.com" }
+        Action    = ["s3:GetObject", "s3:ListBucket"]
+        Resource  = [aws_s3_bucket.main.arn, "${aws_s3_bucket.main.arn}/*"]
+        Condition = { StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id } }
+      },
+      {
+        Sid       = "BedrockWrite"
+        Effect    = "Allow"
+        Principal = { Service = "bedrock.amazonaws.com" }
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.main.arn}/*"
+        Condition = { StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id } }
+      }
+    ]
+  })
+}
+
+output "s3_bucket_name" { value = aws_s3_bucket.main.id }
+output "s3_bucket_arn"  { value = aws_s3_bucket.main.arn }
+```
+
+### terraform/cloudwatch.tf — Logs + Alarms
+
+```hcl
+# terraform/cloudwatch.tf
+
+# Log groups for each Lambda
+resource "aws_cloudwatch_log_group" "bedrock_processor" {
+  name              = "/aws/lambda/${local.name_prefix}-bedrock-processor"
+  retention_in_days = 30
+  tags              = local.common_tags
+}
+
+resource "aws_cloudwatch_log_group" "dynamodb_publisher" {
+  name              = "/aws/lambda/${local.name_prefix}-dynamodb-publisher"
+  retention_in_days = 30
+  tags              = local.common_tags
+}
+
+resource "aws_cloudwatch_log_group" "blueprint_manager" {
+  name              = "/aws/lambda/${local.name_prefix}-blueprint-manager"
+  retention_in_days = 7
+  tags              = local.common_tags
+}
+
+resource "aws_cloudwatch_log_group" "dlq_processor" {
+  name              = "/aws/lambda/${local.name_prefix}-dlq-processor"
+  retention_in_days = 30
+  tags              = local.common_tags
+}
+
+# Alarm: DynamoDB publisher failed (DLQ has messages)
+resource "aws_cloudwatch_metric_alarm" "dynamodb_publisher_dlq_depth" {
+  alarm_name          = "${local.name_prefix}-publisher-dlq-depth"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0    # any message in DLQ = alert
+  
+  dimensions = { QueueName = aws_sqs_queue.dynamodb_publisher_dlq.name }
+  
+  alarm_actions = var.alert_email != "" ? [aws_sns_topic.invoice_errors.arn] : []
+  alarm_description = "Invoice processing failed — check DLQ and CloudWatch logs"
+  tags              = local.common_tags
+}
+
+# Alarm: Bedrock processor failed
+resource "aws_cloudwatch_metric_alarm" "bedrock_processor_errors" {
+  alarm_name          = "${local.name_prefix}-bedrock-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  
+  dimensions = { FunctionName = aws_lambda_function.bedrock_processor.function_name }
+  alarm_actions = var.alert_email != "" ? [aws_sns_topic.invoice_errors.arn] : []
+  tags          = local.common_tags
+}
+```
+
+---
+
+## Step B — Deploy the AWS-Only System (Complete Walkthrough)
+
+### B1. Create the Project
+
+```bash
+# Create project directory
+mkdir freight-audit-aws-only
+cd freight-audit-aws-only
+
+# Create all folders
+mkdir -p lambda_functions/bedrock_invoice_processor
+mkdir -p lambda_functions/dynamodb_publisher
+mkdir -p lambda_functions/bedrock_blueprint_manager
+mkdir -p lambda_functions/ses_email_handler
+mkdir -p lambda_functions/dlq_processor
+mkdir -p terraform/environments
+
+# Copy blueprint JSON (the AI extraction schema — same as original)
+cp /path/to/Invoice-Automation-main/lambda_functions/bedrock_blueprint_manager/bedrock_invoice_blueprint.json \
+   lambda_functions/bedrock_blueprint_manager/
+
+# Copy sample PDFs for testing
+cp -r /path/to/Invoice-Automation-main/test_data ./test_data
+
+# Create Python virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install packages for local testing
+pip install boto3 aws-lambda-powertools requests pytest pytest-mock moto
+```
+
+### B2. Write All Lambda Files
+
+Copy the code from Steps A1, A2, A3 above into their respective `handler.py` files.
+
+For the DLQ processor, use the same code from Part 2 Step 13, but change:
+- `SNS_INVOICE_ERROR_TOPIC_ARN` → still the same env var name (we kept it the same)
+
+### B3. Write All Terraform Files
+
+Create each `.tf` file from the code sections in Step A4 above.
+
+### B4. Set Secrets and Deploy
+
+```bash
+# Set your email for notifications (the ONLY "secret" you need for AWS-only)
+export TF_VAR_alert_email="your@gmail.com"
+
+cd terraform
+
+# Initialize Terraform (download AWS provider)
+terraform init
+
+# If you didn't create the state S3 bucket yet:
+# OPTION: Use LOCAL state (fine for solo development, don't use for teams)
+# Edit versions.tf → remove the "backend" block entirely
+# Terraform will save state to terraform.tfstate locally
+
+# Preview what will be created
+terraform plan -var-file="environments/dev.tfvars"
+
+# Create everything
+terraform apply -var-file="environments/dev.tfvars"
+# Type: yes
+
+# Save the outputs (you'll need the S3 bucket name)
+terraform output
+# s3_bucket_name = "dev-invoice-automation-123456789012"
+```
+
+### B5. Run Blueprint Manager (One-Time Setup)
+
+```bash
+# Create the Bedrock AI project and blueprint
+aws lambda invoke \
+    --function-name dev-invoice-automation-blueprint-manager \
+    --payload '{}' \
+    /tmp/blueprint_out.json
+
+cat /tmp/blueprint_out.json
+# {"statusCode": 200, "body": "{\"blueprint_arn\": \"arn:aws:bedrock:...\", \"project_arn\": \"arn:aws:bedrock:\"}"}
+```
+
+### B6. Confirm SNS Email Subscription
+
+```bash
+# Check your email inbox — AWS sends a confirmation email
+# Subject: "AWS Notification - Subscription Confirmation"  
+# Click the "Confirm subscription" link
+
+# Verify the subscription is active:
+aws sns list-subscriptions-by-topic \
+    --topic-arn $(terraform output -raw sns_success_topic_arn)
+# Should show: "SubscriptionArn": "arn:aws:sns:..." (not "PendingConfirmation")
+```
+
+### B7. Test With Sample PDFs (Option A — Immediate Test)
+
+```bash
+# Get your bucket name from Terraform output
+BUCKET=$(cd terraform && terraform output -raw s3_bucket_name)
+echo "Bucket: $BUCKET"
+
+# Upload a sample PDF — this immediately triggers the pipeline
+aws s3 cp test_data/invoice.pdf "s3://$BUCKET/invoices/invoice_test_001.pdf"
+
+echo "PDF uploaded! Pipeline starting..."
+echo "Check logs in 30 seconds, Bedrock results in 8-13 minutes"
+```
+
+### B8. Watch the Pipeline in Real Time
+
+Open three terminal windows:
+
+```bash
+# Terminal 1: Watch Bedrock processor
+aws logs tail /aws/lambda/dev-invoice-automation-bedrock-processor \
+    --follow --format short
+
+# EXPECTED (within 30 seconds of S3 upload):
+# [INFO] Starting Bedrock job {"s3_key": "invoices/invoice_test_001.pdf"}
+# [INFO] Bedrock job started {"invocation_arn": "arn:aws:bedrock-data-automation..."}
+```
+
+```bash
+# Terminal 2: Watch DynamoDB publisher  
+aws logs tail /aws/lambda/dev-invoice-automation-dynamodb-publisher \
+    --follow --format short
+
+# EXPECTED (8-13 minutes after upload):
+# [INFO] Bedrock extraction complete {"invoice_number": "INV-001", "carrier": "BNSF"}
+# [INFO] Invoice saved to DynamoDB {"table": "dev-invoice-records"}
+```
+
+```bash
+# Terminal 3: Poll DynamoDB to see when invoice appears
+watch -n 30 'aws dynamodb scan \
+    --table-name dev-invoice-records \
+    --select COUNT \
+    --output text'
+# Shows: count going from 0 → 1 when invoice lands
+```
+
+### B9. View Your Extracted Invoices in DynamoDB
+
+```bash
+# See all invoices in the table
+aws dynamodb scan \
+    --table-name dev-invoice-records \
+    --output table
+
+# Query a specific carrier (using the CarrierIndex GSI)
+aws dynamodb query \
+    --table-name dev-invoice-records \
+    --index-name CarrierIndex \
+    --key-condition-expression "Carrier = :carrier" \
+    --expression-attribute-values '{":carrier": {"S": "BNSF"}}' \
+    --output table
+
+# Get a specific invoice by correlation ID
+aws dynamodb get-item \
+    --table-name dev-invoice-records \
+    --key '{
+        "invoice_id": {"S": "YOUR-CORRELATION-ID-HERE"},
+        "processed_at": {"S": "2025-12-17T14:30:22.123456+00:00"}
+    }'
+
+# Export all invoices to JSON file
+aws dynamodb scan \
+    --table-name dev-invoice-records \
+    --output json > all_invoices.json
+
+cat all_invoices.json | python3 -m json.tool | head -100
+```
+
+### B10. Process All 7 Sample PDFs
+
+```bash
+BUCKET=$(cd terraform && terraform output -raw s3_bucket_name)
+
+# Upload all sample PDFs in one command
+for pdf in test_data/*.pdf; do
+    filename=$(basename "$pdf")
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    key="invoices/${timestamp}_${filename// /_}"
+    
+    echo "Uploading: $pdf → s3://$BUCKET/$key"
+    aws s3 cp "$pdf" "s3://$BUCKET/$key"
+    
+    # Small delay between uploads to avoid throttling
+    sleep 2
+done
+
+echo ""
+echo "All PDFs uploaded! Bedrock will process them over the next 10-15 minutes."
+echo "Check DynamoDB for results:"
+echo "  aws dynamodb scan --table-name dev-invoice-records --select COUNT"
+```
+
+---
+
+## Step C — How to View and Use Your Invoice Data
+
+### C1. DynamoDB Console (Easiest)
+
+```
+1. Open AWS Console → DynamoDB
+2. Left sidebar → Tables → dev-invoice-records
+3. Click "Explore table items" (orange button)
+4. You see all invoices as rows, all 18 fields as columns
+5. Click any row to see full details
+```
+
+### C2. Build a Simple Invoice Viewer with Python
+
+Create `view_invoices.py` locally:
+
+```python
+"""Simple script to view and query your invoice records."""
+
+import boto3
+from decimal import Decimal
+
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+table    = dynamodb.Table('dev-invoice-records')
+
+def list_all_invoices():
+    """Print all invoices in a formatted table."""
+    response = table.scan()
+    invoices = response.get('Items', [])
+    
+    print(f"\n{'='*90}")
+    print(f"{'Invoice Number':<20} {'Carrier':<10} {'Amount':<12} {'Origin':<15} {'Destination':<15} {'Date'}")
+    print(f"{'='*90}")
+    
+    for inv in sorted(invoices, key=lambda x: x.get('processed_at', ''), reverse=True):
+        print(
+            f"{inv.get('InvoiceNumber', 'N/A'):<20} "
+            f"{inv.get('Carrier', 'N/A'):<10} "
+            f"{inv.get('FeeAmount', 'N/A'):<12} "
+            f"{inv.get('OriginCity', '')[:13]:<15} "
+            f"{inv.get('DestinationCity', '')[:13]:<15} "
+            f"{inv.get('InvoiceDate', 'N/A')}"
+        )
+    
+    print(f"{'='*90}")
+    print(f"Total invoices: {len(invoices)}")
+
+def list_by_carrier(carrier_name):
+    """List all invoices from a specific carrier."""
+    response = table.query(
+        IndexName='CarrierIndex',
+        KeyConditionExpression=boto3.dynamodb.conditions.Key('Carrier').eq(carrier_name)
+    )
+    invoices = response.get('Items', [])
+    
+    print(f"\nInvoices from {carrier_name}: {len(invoices)}")
+    for inv in invoices:
+        print(f"  {inv.get('InvoiceNumber')} | ${inv.get('FeeAmount')} | {inv.get('InvoiceDate')}")
+    
+    # Calculate total amount
+    amounts = []
+    for inv in invoices:
+        try:
+            amounts.append(float(inv.get('FeeAmount', 0)))
+        except (ValueError, TypeError):
+            pass
+    if amounts:
+        print(f"  Total amount: ${sum(amounts):,.2f}")
+
+if __name__ == '__main__':
+    print("\n🔍 All Invoices:")
+    list_all_invoices()
+    
+    print("\n📦 BNSF Invoices:")
+    list_by_carrier('BNSF')
+```
+
+```bash
+# Run it:
+python3 view_invoices.py
+
+# Expected output:
+# All Invoices:
+# ==========================================================================================
+# Invoice Number       Carrier    Amount       Origin          Destination     Date
+# ==========================================================================================
+# BNSF-2025-12345     BNSF       45335.98     Chicago         Denver          11/05/2025
+# UP-339816004        UP         28750.00     Denver          Portland        10/15/2025
+# ...
+# Total invoices: 7
+```
+
+---
+
+## AWS-Only System: What You Have vs What the Original Has
+
+```
+FEATURE                    ORIGINAL SYSTEM        AWS-ONLY SYSTEM
+─────────────────────────────────────────────────────────────────────────
+Email receiving            Microsoft Graph API    AWS SES (Option B)
+Authentication             MSAL + Azure AD        AWS IAM (automatic)
+PDF storage                S3                     S3 (same)
+AI extraction              Bedrock Data Auto.     Bedrock Data Auto. (same)
+Event routing              EventBridge            EventBridge (same)
+Invoice storage            GVP Oracle database    Amazon DynamoDB
+Invoice viewing            GVP web UI             AWS Console / Python script
+Success notifications      GVP creates record     SNS email to you
+Failure alerts             SNS email              SNS email (same)
+Error recovery             DLQ + SNS alert        DLQ + SNS alert (same)
+Infrastructure             Terraform              Terraform (same)
+Observability              CloudWatch             CloudWatch (same)
+External credentials       Azure AD, GVP API key  NONE needed
+Monthly cost               ~$58 (1000 invoices)   ~$8 (1000 invoices) *
+                                                  * cheaper: no Azure overhead
+
+* Bedrock Data Automation: ~$50, DynamoDB: $0 (free tier), rest: ~$8
+```
+
+---
+
+## Cleanup — Delete Everything When Done
+
+```bash
+cd terraform
+
+# Destroy all AWS resources
+terraform destroy -var-file="environments/dev.tfvars"
+# Type: yes
+
+# This deletes: all Lambdas, S3 bucket, DynamoDB table, EventBridge rules,
+# SQS queues, SNS topics, IAM roles, CloudWatch logs, alarms
+
+# Note: Bedrock blueprint and project are NOT managed by Terraform in this setup
+# Delete them manually:
+aws bedrock-data-automation delete-data-automation-project \
+    --project-arn "arn:aws:bedrock:us-east-1:ACCOUNT:data-automation-project/..."
+
+# Also delete the Terraform state bucket if done forever:
+aws s3 rm s3://freight-audit-terraform-state --recursive
+aws s3 rb s3://freight-audit-terraform-state
+```
+
+---
+
+## Final Summary: AWS-Only Approach in 5 Steps
+
+```
+STEP 1 (one time, 5 minutes):
+  terraform apply → creates ALL AWS resources automatically
+
+STEP 2 (one time, 1 minute):
+  aws lambda invoke → blueprint-manager → creates Bedrock AI project
+
+STEP 3 (whenever you have an invoice PDF):
+  aws s3 cp invoice.pdf s3://bucket/invoices/
+
+STEP 4 (automatic, takes 8-13 minutes):
+  Bedrock reads PDF → extracts 18 fields → saves to DynamoDB
+
+STEP 5 (whenever you want to see results):
+  aws dynamodb scan --table-name dev-invoice-records
+
+That's the entire workflow. 
+No Microsoft 365. No Azure AD. No GVP. No external APIs.
+Just AWS.
+```
+
+*This completes Part 3. You now have three complete guides: (1) deep architecture explanation, (2) how to build the M365+GVP version from scratch, and (3) how to build the 100% AWS version from scratch using only your sample PDFs.*
